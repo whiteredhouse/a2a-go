@@ -349,6 +349,62 @@ func (f *factory) CreateCanceler(ctx context.Context, params *a2a.CancelTaskRequ
 	return canceler, processor, &cleaner{cleaners: f.cleaners, execCtx: execCtx}, nil
 }
 
+// CreateUpdater creates a task updater, which publishes events the agent
+// produced outside an execution, and the processor which applies them.
+func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest) (taskexec.Updater, taskexec.Processor, taskexec.Cleaner, error) {
+	if len(req.Events) == 0 || !a2aevent.IsFinal(req.Events[len(req.Events)-1]) {
+		return nil, nil, nil, fmt.Errorf("an update must end with a final event: %w", a2a.ErrInvalidParams)
+	}
+	for _, event := range req.Events {
+		switch event.(type) {
+		case *a2a.TaskStatusUpdateEvent, *a2a.TaskArtifactUpdateEvent:
+		default:
+			return nil, nil, nil, fmt.Errorf("an update takes only status and artifact update events, not %T: %w", event, a2a.ErrInvalidParams)
+		}
+		if event.TaskInfo().TaskID != req.TaskID {
+			return nil, nil, nil, fmt.Errorf("an event of the update is for another task: %w", a2a.ErrInvalidParams)
+		}
+	}
+
+	storedTask, err := f.taskStore.Get(ctx, req.TaskID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to load a task: %w", err)
+	}
+	task, version := storedTask.Task, storedTask.Version
+	if task.Status.State.Terminal() {
+		return nil, nil, nil, fmt.Errorf("task in a terminal state %q: %w", task.Status.State, a2a.ErrUnsupportedOperation)
+	}
+
+	execCtx := &ExecutorContext{
+		TaskID:     task.ID,
+		StoredTask: task,
+		ContextID:  task.ContextID,
+	}
+	updateManager, err := taskupdate.NewManager(f.taskStore, execCtx.TaskInfo(), &taskstore.StoredTask{Task: task, Version: version}, f.materializer)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("taskupdate manager: %w", err)
+	}
+	processor := newProcessor(updateManager, f.pushConfigStore, f.pushDelivery, execCtx, f.taskStore)
+	return &updater{events: req.Events}, processor, &cleaner{cleaners: f.cleaners, execCtx: execCtx}, nil
+}
+
+// updater writes the events of an update.
+type updater struct {
+	events []a2a.Event
+}
+
+var _ taskexec.Updater = (*updater)(nil)
+
+// Update implements [taskexec.Updater].
+func (u *updater) Update(ctx context.Context, q eventpipe.Writer) error {
+	for _, event := range u.events {
+		if err := q.Write(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func acceptedOutputModes(req *a2a.SendMessageRequest) []string {
 	if req.Config == nil {
 		return nil

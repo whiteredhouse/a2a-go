@@ -289,6 +289,38 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 	return ih
 }
 
+// TaskUpdater is implemented by the request handler which [NewHandler]
+// returns. It lets the agent publish events to one of its tasks outside a
+// request, such as ending a task which waits for input when the input does not
+// come in time. It is the server's own call, not a caller's: it is not served
+// to clients, it runs no call interceptors, and it reaches the task whoever
+// owns it (see [taskstore.WithServerAccess]).
+type TaskUpdater interface {
+	// UpdateTask publishes events to the task with the given ID through the
+	// same pipeline as the events of an execution: the task store and push
+	// notifications. The events are status and artifact update events of that
+	// task, and the last one is final: it ends the task or interrupts it, as
+	// the last event of an execution does. A task which has ended, or which has
+	// an active execution or cancelation, is refused: during an execution its
+	// agent publishes the events itself. UpdateTask returns the task the
+	// events result in. It is not supported in cluster mode
+	// ([WithClusterMode]) yet.
+	UpdateTask(ctx context.Context, taskID a2a.TaskID, events ...a2a.Event) (*a2a.Task, error)
+}
+
+// UpdateTask implements [TaskUpdater].
+func (h *defaultRequestHandler) UpdateTask(ctx context.Context, taskID a2a.TaskID, events ...a2a.Event) (*a2a.Task, error) {
+	if taskID == "" {
+		return nil, fmt.Errorf("missing TaskID: %w", a2a.ErrInvalidParams)
+	}
+	ctx = taskstore.WithServerAccess(ctx)
+	task, err := h.execManager.Update(ctx, &taskexec.UpdateRequest{TaskID: taskID, Events: events})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update: %w", err)
+	}
+	return task, nil
+}
+
 // GetTask implements RequestHandler.
 func (h *defaultRequestHandler) GetTask(ctx context.Context, req *a2a.GetTaskRequest) (*a2a.Task, error) {
 	taskID := req.ID

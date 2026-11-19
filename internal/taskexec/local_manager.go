@@ -256,6 +256,55 @@ func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (
 	return convertToCancelationResult(ctx, result, err)
 }
 
+// Update publishes the events of req through the task's update pipeline: the
+// task store and push notifications, as for the events of an execution. A task
+// with an active execution or cancelation is refused with [ErrExecutionActive]:
+// its agent publishes events through that execution. An update and an
+// execution started at the same time are kept apart by the task store's
+// version check.
+func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error) {
+	m.mu.Lock()
+	_, executing := m.executions[req.TaskID]
+	_, canceling := m.cancelations[req.TaskID]
+	m.mu.Unlock()
+	if executing || canceling {
+		return nil, ErrExecutionActive
+	}
+
+	updater, processor, cleaner, err := m.factory.CreateUpdater(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("updater setup failed: %w", err)
+	}
+
+	pipe := eventpipe.NewLocal()
+	defer pipe.Close()
+
+	handler := &executionHandler{
+		agentEvents:   pipe.Reader,
+		handleEventFn: processor.Process,
+		handleErrorFn: func(ctx context.Context, err error) (a2a.SendMessageResult, error) { return nil, err },
+	}
+	result, err := runProducerConsumer(
+		ctx,
+		func(ctx context.Context) error { return updater.Update(ctx, pipe.Writer) },
+		handler.processEvents,
+		nil,
+		m.panicHandler,
+		nil,
+	)
+
+	cleaner.Cleanup(ctx, result, err)
+
+	if err != nil {
+		return nil, fmt.Errorf("update failed: %w", err)
+	}
+	task, ok := result.(*a2a.Task)
+	if !ok {
+		return nil, fmt.Errorf("bug: update result was %T, not a task", result)
+	}
+	return task, nil
+}
+
 func (m *localManager) cleanupExecution(ctx context.Context, execution *localExecution) {
 	m.destroyQueue(ctx, execution.tid)
 	execution.pipe.Close()

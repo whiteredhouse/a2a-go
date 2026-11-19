@@ -60,6 +60,17 @@ func (h *InterceptedHandler) ListTasks(ctx context.Context, req *a2a.ListTasksRe
 	return doCall(ctx, callCtx, h, req, h.Handler.ListTasks)
 }
 
+// UpdateTask implements [TaskUpdater] when the handler it wraps does. It
+// runs no call interceptors and no plugins: it is the server's own call, not
+// a caller's.
+func (h *InterceptedHandler) UpdateTask(ctx context.Context, taskID a2a.TaskID, events ...a2a.Event) (*a2a.Task, error) {
+	u, ok := h.Handler.(TaskUpdater)
+	if !ok {
+		return nil, fmt.Errorf("the request handler does not update tasks: %w", a2a.ErrUnsupportedOperation)
+	}
+	return u.UpdateTask(ctx, taskID, events...)
+}
+
 // CancelTask implements RequestHandler.
 func (h *InterceptedHandler) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error) {
 	ctx, callCtx := attachMethodCallContext(ctx, "CancelTask", req.Tenant)

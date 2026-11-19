@@ -116,9 +116,13 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 		return TaskVersionMissing, err
 	}
 
-	userName, err := s.config.Authenticator(ctx)
-	if err != nil {
-		return TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
+	server := IsServerAccess(ctx)
+	var userName string
+	if !server {
+		var err error
+		if userName, err = s.config.Authenticator(ctx); err != nil {
+			return TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
+		}
 	}
 
 	taskCopy, err := utils.DeepCopy(req.Task)
@@ -134,7 +138,7 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 		return TaskVersionMissing, a2a.ErrTaskNotFound
 	}
 
-	if stored.user != userName {
+	if !server && stored.user != userName {
 		return TaskVersionMissing, a2a.ErrTaskNotFound
 	}
 
@@ -163,12 +167,14 @@ func (s *InMemory) Get(ctx context.Context, taskID a2a.TaskID) (*StoredTask, err
 	}
 
 	// Mask ownership mismatch as ErrTaskNotFound per A2A spec §3.3.2
-	userName, err := s.config.Authenticator(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("taskstore auth failed: %w", err)
-	}
-	if storedTask.user != userName {
-		return nil, a2a.ErrTaskNotFound
+	if !IsServerAccess(ctx) {
+		userName, err := s.config.Authenticator(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("taskstore auth failed: %w", err)
+		}
+		if storedTask.user != userName {
+			return nil, a2a.ErrTaskNotFound
+		}
 	}
 
 	task, err := utils.DeepCopy(storedTask.task)
