@@ -32,8 +32,8 @@ var ErrAgentInactivityTimeout = errors.New("agent inactivity timeout")
 
 // ErrExecutionActive is returned by [Manager.Update] when the task has an
 // active execution or cancelation, whose agent publishes the task's events
-// itself.
-var ErrExecutionActive = errors.New("task has an active execution or cancelation")
+// itself, or another update.
+var ErrExecutionActive = errors.New("task has an active execution, cancelation or update")
 
 // UpdateRequest is an update which the agent publishes to one of its tasks
 // outside an execution, such as ending a task which waits for input when the
@@ -78,6 +78,7 @@ type Factory interface {
 	CreateCanceler(context.Context, *a2a.CancelTaskRequest) (Canceler, Processor, Cleaner, error)
 
 	// CreateUpdater is used to create initialized Updater and Processor for a Task update which will run in separate goroutines.
+	// The Cleaner may be nil: an update runs no execution, so it need not run execution cleanup.
 	CreateUpdater(context.Context, *UpdateRequest) (Updater, Processor, Cleaner, error)
 }
 

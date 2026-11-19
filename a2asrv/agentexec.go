@@ -352,17 +352,33 @@ func (f *factory) CreateCanceler(ctx context.Context, params *a2a.CancelTaskRequ
 // CreateUpdater creates a task updater, which publishes events the agent
 // produced outside an execution, and the processor which applies them.
 func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest) (taskexec.Updater, taskexec.Processor, taskexec.Cleaner, error) {
-	if len(req.Events) == 0 || !a2aevent.IsFinal(req.Events[len(req.Events)-1]) {
-		return nil, nil, nil, fmt.Errorf("an update must end with a final event: %w", a2a.ErrInvalidParams)
+	// The whole batch is checked before anything is written: the processor
+	// would end at the first final event, and fail the task on an event it
+	// can't apply.
+	if len(req.Events) == 0 {
+		return nil, nil, nil, fmt.Errorf("an update takes at least one event: %w", a2a.ErrInvalidParams)
 	}
-	for _, event := range req.Events {
-		switch event.(type) {
-		case *a2a.TaskStatusUpdateEvent, *a2a.TaskArtifactUpdateEvent:
+	for i, event := range req.Events {
+		switch e := event.(type) {
+		case *a2a.TaskStatusUpdateEvent:
+			if e == nil {
+				return nil, nil, nil, fmt.Errorf("event %d of the update is nil: %w", i, a2a.ErrInvalidParams)
+			}
+		case *a2a.TaskArtifactUpdateEvent:
+			if e == nil {
+				return nil, nil, nil, fmt.Errorf("event %d of the update is nil: %w", i, a2a.ErrInvalidParams)
+			}
 		default:
 			return nil, nil, nil, fmt.Errorf("an update takes only status and artifact update events, not %T: %w", event, a2a.ErrInvalidParams)
 		}
 		if event.TaskInfo().TaskID != req.TaskID {
-			return nil, nil, nil, fmt.Errorf("an event of the update is for another task: %w", a2a.ErrInvalidParams)
+			return nil, nil, nil, fmt.Errorf("event %d of the update is for another task: %w", i, a2a.ErrInvalidParams)
+		}
+		if final, last := a2aevent.IsFinal(event), i == len(req.Events)-1; final != last {
+			if last {
+				return nil, nil, nil, fmt.Errorf("an update must end with a final event: %w", a2a.ErrInvalidParams)
+			}
+			return nil, nil, nil, fmt.Errorf("event %d of the update is final, but not the last: %w", i, a2a.ErrInvalidParams)
 		}
 	}
 
@@ -373,6 +389,11 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 	task, version := storedTask.Task, storedTask.Version
 	if task.Status.State.Terminal() {
 		return nil, nil, nil, fmt.Errorf("task in a terminal state %q: %w", task.Status.State, a2a.ErrUnsupportedOperation)
+	}
+	for i, event := range req.Events {
+		if event.TaskInfo().ContextID != task.ContextID {
+			return nil, nil, nil, fmt.Errorf("event %d of the update is for another context: %w", i, a2a.ErrInvalidParams)
+		}
 	}
 
 	execCtx := &ExecutorContext{
@@ -385,7 +406,9 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 		return nil, nil, nil, fmt.Errorf("taskupdate manager: %w", err)
 	}
 	processor := newProcessor(updateManager, f.pushConfigStore, f.pushDelivery, execCtx, f.taskStore)
-	return &updater{events: req.Events}, processor, &cleaner{cleaners: f.cleaners, execCtx: execCtx}, nil
+	// No cleaner: the agent's execution cleanup hooks run after its Execute
+	// and Cancel calls, and an update makes neither.
+	return &updater{events: req.Events}, processor, nil, nil
 }
 
 // updater writes the events of an update.
