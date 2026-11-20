@@ -393,10 +393,33 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 	if task.Status.State.Terminal() {
 		return nil, nil, nil, fmt.Errorf("task in a terminal state %q: %w", task.Status.State, a2a.ErrUnsupportedOperation)
 	}
+	// Each event must apply to the task as the events before it leave it: an
+	// artifact appended to must exist, in the task or earlier in the batch.
+	// Materializers are pure, so the events are applied to the stored task as
+	// a trial, before anything is written.
+	artifacts := make(map[a2a.ArtifactID]bool, len(task.Artifacts))
+	for _, artifact := range task.Artifacts {
+		artifacts[artifact.ID] = true
+	}
+	trial := task
 	for i, event := range req.Events {
 		if event.TaskInfo().ContextID != task.ContextID {
 			return nil, nil, nil, fmt.Errorf("event %d of the update is for another context: %w", i, a2a.ErrInvalidParams)
 		}
+		if e, ok := event.(*a2a.TaskArtifactUpdateEvent); ok {
+			if e.Append && !artifacts[e.Artifact.ID] {
+				return nil, nil, nil, fmt.Errorf("event %d of the update appends to an unknown artifact: %w", i, a2a.ErrInvalidParams)
+			}
+			artifacts[e.Artifact.ID] = true
+		}
+		next, err := f.materializer.ApplyUpdate(ctx, trial, event)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("event %d of the update can't be applied: %v: %w", i, err, a2a.ErrInvalidParams)
+		}
+		if next == nil {
+			return nil, nil, nil, fmt.Errorf("bug: task materializer returned nil task for %T", event)
+		}
+		trial = next
 	}
 
 	execCtx := &ExecutorContext{

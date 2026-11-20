@@ -115,6 +115,11 @@ func TestUpdateTaskValidatesEvents(t *testing.T) {
 			a2a.NewArtifactEvent(task),
 			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
 		},
+		"append to an unknown artifact": {
+			a2a.NewArtifactEvent(task, a2a.NewTextPart("partial")),
+			a2a.NewArtifactUpdateEvent(task, "unknown", a2a.NewTextPart("more")),
+			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
+		},
 		"nil artifact payload": {
 			&a2a.TaskArtifactUpdateEvent{TaskID: task.ID, ContextID: task.ContextID},
 			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
@@ -126,14 +131,15 @@ func TestUpdateTaskValidatesEvents(t *testing.T) {
 		}
 	}
 	got, err := h.GetTask(asUser("alice"), &a2a.GetTaskRequest{ID: task.ID})
-	if err != nil || got.Status.State != a2a.TaskStateInputRequired {
-		t.Errorf("after refused updates: %v %v, want the task still waiting", got, err)
+	if err != nil || got.Status.State != a2a.TaskStateInputRequired || len(got.Artifacts) != 0 {
+		t.Errorf("after refused updates: %v %v, want the task still waiting, with no artifacts", got, err)
 	}
 	// Several events, the last final.
 	artifact := a2a.NewArtifactEvent(task, a2a.NewTextPart("partial"))
 	done := a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil)
-	got, err = updater.UpdateTask(context.Background(), task.ID, artifact, done)
-	if err != nil || got.Status.State != a2a.TaskStateCompleted || len(got.Artifacts) != 1 {
+	more := a2a.NewArtifactUpdateEvent(task, artifact.Artifact.ID, a2a.NewTextPart(" and more"))
+	got, err = updater.UpdateTask(context.Background(), task.ID, artifact, more, done)
+	if err != nil || got.Status.State != a2a.TaskStateCompleted || len(got.Artifacts) != 1 || len(got.Artifacts[0].Parts) != 2 {
 		t.Errorf("UpdateTask(artifact, completed) = %v %v", got, err)
 	}
 }
@@ -247,7 +253,10 @@ type replyingSender struct {
 func (s *replyingSender) SendPush(ctx context.Context, config *a2a.PushConfig, event a2a.Event) error {
 	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("blue"))
 	answer.TaskID = event.TaskInfo().TaskID
-	_, err := s.h.SendMessage(asUser("alice"), &a2a.SendMessageRequest{Message: answer})
+	// Bounded, so that a deadlock fails the test rather than hanging it.
+	replyCtx, cancel := context.WithTimeout(asUser("alice"), 2*time.Second)
+	defer cancel()
+	_, err := s.h.SendMessage(replyCtx, &a2a.SendMessageRequest{Message: answer})
 	s.replied <- err
 	return nil
 }
