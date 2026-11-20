@@ -41,10 +41,9 @@ var ErrExecutionActive = errors.New("task has an active execution, cancelation o
 type UpdateRequest struct {
 	// TaskID is the ID of the task to update.
 	TaskID a2a.TaskID
-	// Events are the events to publish, in order. The last one is final:
-	// it ends the task or interrupts it, as the last event of an execution
-	// does.
-	Events []a2a.Event
+	// Event is the status update to publish. It is final: it ends the task
+	// or interrupts it, as the last event of an execution does.
+	Event *a2a.TaskStatusUpdateEvent
 }
 
 // Manager provides an API for executing and canceling tasks.

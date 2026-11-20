@@ -352,37 +352,15 @@ func (f *factory) CreateCanceler(ctx context.Context, params *a2a.CancelTaskRequ
 // CreateUpdater creates a task updater, which publishes events the agent
 // produced outside an execution, and the processor which applies them.
 func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest) (taskexec.Updater, taskexec.Processor, taskexec.Cleaner, error) {
-	// The whole batch is checked before anything is written: the processor
-	// would end at the first final event, and fail the task on an event it
-	// can't apply.
-	if len(req.Events) == 0 {
-		return nil, nil, nil, fmt.Errorf("an update takes at least one event: %w", a2a.ErrInvalidParams)
+	event := req.Event
+	if event == nil {
+		return nil, nil, nil, fmt.Errorf("an update takes a status update event: %w", a2a.ErrInvalidParams)
 	}
-	for i, event := range req.Events {
-		switch e := event.(type) {
-		case *a2a.TaskStatusUpdateEvent:
-			if e == nil {
-				return nil, nil, nil, fmt.Errorf("event %d of the update is nil: %w", i, a2a.ErrInvalidParams)
-			}
-		case *a2a.TaskArtifactUpdateEvent:
-			if e == nil {
-				return nil, nil, nil, fmt.Errorf("event %d of the update is nil: %w", i, a2a.ErrInvalidParams)
-			}
-			if e.Artifact == nil || len(e.Artifact.Parts) == 0 {
-				return nil, nil, nil, fmt.Errorf("event %d of the update has an empty artifact: %w", i, a2a.ErrInvalidParams)
-			}
-		default:
-			return nil, nil, nil, fmt.Errorf("an update takes only status and artifact update events, not %T: %w", event, a2a.ErrInvalidParams)
-		}
-		if event.TaskInfo().TaskID != req.TaskID {
-			return nil, nil, nil, fmt.Errorf("event %d of the update is for another task: %w", i, a2a.ErrInvalidParams)
-		}
-		if final, last := a2aevent.IsFinal(event), i == len(req.Events)-1; final != last {
-			if last {
-				return nil, nil, nil, fmt.Errorf("an update must end with a final event: %w", a2a.ErrInvalidParams)
-			}
-			return nil, nil, nil, fmt.Errorf("event %d of the update is final, but not the last: %w", i, a2a.ErrInvalidParams)
-		}
+	if event.TaskID != req.TaskID {
+		return nil, nil, nil, fmt.Errorf("the update's event is for another task: %w", a2a.ErrInvalidParams)
+	}
+	if !a2aevent.IsFinal(event) {
+		return nil, nil, nil, fmt.Errorf("an update ends the task or interrupts it, not %q: %w", event.Status.State, a2a.ErrInvalidParams)
 	}
 
 	storedTask, err := f.taskStore.Get(ctx, req.TaskID)
@@ -393,24 +371,8 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 	if task.Status.State.Terminal() {
 		return nil, nil, nil, fmt.Errorf("task in a terminal state %q: %w", task.Status.State, a2a.ErrUnsupportedOperation)
 	}
-	// An artifact appended to must exist, in the task or earlier in the batch.
-	// With the checks above, this refuses every event the default materializer
-	// can't apply. A custom materializer runs only as the events are written,
-	// since it may depend on what the store holds.
-	artifacts := make(map[a2a.ArtifactID]bool, len(task.Artifacts))
-	for _, artifact := range task.Artifacts {
-		artifacts[artifact.ID] = true
-	}
-	for i, event := range req.Events {
-		if event.TaskInfo().ContextID != task.ContextID {
-			return nil, nil, nil, fmt.Errorf("event %d of the update is for another context: %w", i, a2a.ErrInvalidParams)
-		}
-		if e, ok := event.(*a2a.TaskArtifactUpdateEvent); ok {
-			if e.Append && !artifacts[e.Artifact.ID] {
-				return nil, nil, nil, fmt.Errorf("event %d of the update appends to an unknown artifact: %w", i, a2a.ErrInvalidParams)
-			}
-			artifacts[e.Artifact.ID] = true
-		}
+	if event.ContextID != task.ContextID {
+		return nil, nil, nil, fmt.Errorf("the update's event is for another context: %w", a2a.ErrInvalidParams)
 	}
 
 	execCtx := &ExecutorContext{
@@ -425,24 +387,19 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 	processor := newProcessor(updateManager, f.pushConfigStore, f.pushDelivery, execCtx, f.taskStore)
 	// No cleaner: the agent's execution cleanup hooks run after its Execute
 	// and Cancel calls, and an update makes neither.
-	return &updater{events: req.Events}, processor, nil, nil
+	return &updater{event: event}, processor, nil, nil
 }
 
-// updater writes the events of an update.
+// updater writes the event of an update.
 type updater struct {
-	events []a2a.Event
+	event *a2a.TaskStatusUpdateEvent
 }
 
 var _ taskexec.Updater = (*updater)(nil)
 
 // Update implements [taskexec.Updater].
 func (u *updater) Update(ctx context.Context, q eventpipe.Writer) error {
-	for _, event := range u.events {
-		if err := q.Write(ctx, event); err != nil {
-			return err
-		}
-	}
-	return nil
+	return q.Write(ctx, u.event)
 }
 
 func acceptedOutputModes(req *a2a.SendMessageRequest) []string {

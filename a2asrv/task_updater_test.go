@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
-	"github.com/a2aproject/a2a-go/v2/a2aevent"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
@@ -84,7 +83,7 @@ func TestUpdateTaskEndsAWaitingTask(t *testing.T) {
 	reason := a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("timed out"))
 	failed := a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, reason)
 	// The server's own call: no caller, whoever owns the task.
-	got, err := updater.UpdateTask(context.Background(), task.ID, failed)
+	got, err := updater.UpdateTask(context.Background(), failed)
 	if err != nil {
 		t.Fatalf("UpdateTask() error = %v", err)
 	}
@@ -103,60 +102,33 @@ func TestUpdateTaskEndsAWaitingTask(t *testing.T) {
 		t.Errorf("GetTask() as another user error = %v, want ErrTaskNotFound", err)
 	}
 	// An ended task takes no more updates.
-	if _, err := updater.UpdateTask(context.Background(), task.ID, failed); !errors.Is(err, a2a.ErrUnsupportedOperation) {
+	if _, err := updater.UpdateTask(context.Background(), failed); !errors.Is(err, a2a.ErrUnsupportedOperation) {
 		t.Errorf("UpdateTask() of an ended task error = %v, want ErrUnsupportedOperation", err)
 	}
 }
 
-func TestUpdateTaskValidatesEvents(t *testing.T) {
+func TestUpdateTaskValidatesTheEvent(t *testing.T) {
 	h, task := newWaitingTask(t, "alice", nil)
 	updater := h.(TaskUpdater)
-	other := &a2a.Task{ID: "other", ContextID: task.ContextID}
 	otherContext := &a2a.Task{ID: task.ID, ContextID: "another-context"}
-	var nilStatus *a2a.TaskStatusUpdateEvent
-	var nilArtifact *a2a.TaskArtifactUpdateEvent
-	for name, events := range map[string][]a2a.Event{
-		"none":            nil,
-		"not final":       {a2a.NewStatusUpdateEvent(task, a2a.TaskStateWorking, nil)},
-		"another task":    {a2a.NewStatusUpdateEvent(other, a2a.TaskStateFailed, nil)},
-		"another context": {a2a.NewStatusUpdateEvent(otherContext, a2a.TaskStateFailed, nil)},
-		"not task update": {a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("x"))},
-		"early final": {
-			a2a.NewStatusUpdateEvent(task, a2a.TaskStateInputRequired, nil),
-			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
-		},
-		"nil status": {nilStatus},
-		"empty artifact": {
-			a2a.NewArtifactEvent(task, a2a.NewTextPart("partial")),
-			a2a.NewArtifactEvent(task),
-			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
-		},
-		"append to an unknown artifact": {
-			a2a.NewArtifactEvent(task, a2a.NewTextPart("partial")),
-			a2a.NewArtifactUpdateEvent(task, "unknown", a2a.NewTextPart("more")),
-			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
-		},
-		"nil artifact payload": {
-			&a2a.TaskArtifactUpdateEvent{TaskID: task.ID, ContextID: task.ContextID},
-			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
-		},
-		"nil artifact": {nilArtifact, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)},
+	for name, event := range map[string]*a2a.TaskStatusUpdateEvent{
+		"nil":             nil,
+		"no task":         a2a.NewStatusUpdateEvent(&a2a.Task{ContextID: task.ContextID}, a2a.TaskStateFailed, nil),
+		"not final":       a2a.NewStatusUpdateEvent(task, a2a.TaskStateWorking, nil),
+		"another context": a2a.NewStatusUpdateEvent(otherContext, a2a.TaskStateFailed, nil),
 	} {
-		if _, err := updater.UpdateTask(context.Background(), task.ID, events...); !errors.Is(err, a2a.ErrInvalidParams) {
+		if _, err := updater.UpdateTask(context.Background(), event); !errors.Is(err, a2a.ErrInvalidParams) {
 			t.Errorf("UpdateTask(%s) error = %v, want ErrInvalidParams", name, err)
 		}
 	}
 	got, err := h.GetTask(asUser("alice"), &a2a.GetTaskRequest{ID: task.ID})
-	if err != nil || got.Status.State != a2a.TaskStateInputRequired || len(got.Artifacts) != 0 {
-		t.Errorf("after refused updates: %v %v, want the task still waiting, with no artifacts", got, err)
+	if err != nil || got.Status.State != a2a.TaskStateInputRequired {
+		t.Errorf("after refused updates: %v %v, want the task still waiting", got, err)
 	}
-	// Several events, the last final.
-	artifact := a2a.NewArtifactEvent(task, a2a.NewTextPart("partial"))
-	done := a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil)
-	more := a2a.NewArtifactUpdateEvent(task, artifact.Artifact.ID, a2a.NewTextPart(" and more"))
-	got, err = updater.UpdateTask(context.Background(), task.ID, artifact, more, done)
-	if err != nil || got.Status.State != a2a.TaskStateCompleted || len(got.Artifacts) != 1 || len(got.Artifacts[0].Parts) != 2 {
-		t.Errorf("UpdateTask(artifact, completed) = %v %v", got, err)
+	// Another task the store does not have.
+	other := a2a.NewStatusUpdateEvent(&a2a.Task{ID: "other", ContextID: task.ContextID}, a2a.TaskStateFailed, nil)
+	if _, err := updater.UpdateTask(context.Background(), other); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Errorf("UpdateTask(unknown task) error = %v, want ErrTaskNotFound", err)
 	}
 }
 
@@ -182,7 +154,7 @@ func TestUpdateTaskRefusesATaskWithAnActiveExecution(t *testing.T) {
 		done <- err
 	}()
 	<-started
-	_, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil))
+	_, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil))
 	close(release)
 	if !errors.Is(err, ErrTaskActive) {
 		t.Errorf("UpdateTask() during an execution error = %v, want ErrTaskActive", err)
@@ -227,7 +199,7 @@ func TestUpdateTaskHoldsTheTaskUntilItEnds(t *testing.T) {
 
 	updated := make(chan error, 1)
 	go func() {
-		_, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil))
+		_, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil))
 		updated <- err
 	}()
 	<-store.reading
@@ -296,7 +268,7 @@ func TestUpdateTaskPushRecipientMayAnswer(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	got, err := h.(TaskUpdater).UpdateTask(ctx, task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateInputRequired, nil))
+	got, err := h.(TaskUpdater).UpdateTask(ctx, a2a.NewStatusUpdateEvent(task, a2a.TaskStateInputRequired, nil))
 	if err != nil {
 		t.Fatalf("UpdateTask() error = %v", err)
 	}
@@ -314,40 +286,11 @@ func TestUpdateTaskRunsNoExecutionCleanup(t *testing.T) {
 	cleaned := false
 	agent := &mockAgentExecutor{CleanupFn: func(context.Context, a2a.SendMessageResult, error) { cleaned = true }}
 	h, task, _ := newWaitingTaskIn(t, "alice", agent, store)
-	if _, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); err != nil {
+	if _, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); err != nil {
 		t.Fatalf("UpdateTask() error = %v", err)
 	}
 	if cleaned {
 		t.Error("an update ran the agent's execution cleanup")
-	}
-}
-
-// A custom materializer runs only as each event is written, so it may
-// depend on what the store holds by then.
-func TestUpdateTaskCustomMaterializerSeesEarlierEvents(t *testing.T) {
-	store := newUpdaterStore()
-	materializer := taskstore.NewFullUpdateMaterializer(func(task *a2a.Task, event a2a.Event) (*a2a.Task, error) {
-		if e, ok := event.(*a2a.TaskStatusUpdateEvent); ok && e.Status.State == a2a.TaskStateCompleted {
-			stored, err := store.Get(asServer(), task.ID)
-			if err != nil {
-				return nil, err
-			}
-			if len(stored.Task.Artifacts) == 0 {
-				return nil, errors.New("completed before its artifact was stored")
-			}
-		}
-		return a2aevent.ApplyShallowUpdate(task, event)
-	})
-	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateInputRequired}}
-	if _, err := store.Create(asUser("alice"), task); err != nil {
-		t.Fatal(err)
-	}
-	h := NewHandler(&mockAgentExecutor{}, WithTaskStore(store), WithUpdateMaterializer(materializer))
-	got, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID,
-		a2a.NewArtifactEvent(task, a2a.NewTextPart("result")),
-		a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil))
-	if err != nil || got.Status.State != a2a.TaskStateCompleted {
-		t.Fatalf("UpdateTask() = %v %v, want completed", got, err)
 	}
 }
 
@@ -357,7 +300,7 @@ func TestUpdateTaskNeedsAStoreWhichKnowsTheServer(t *testing.T) {
 	for _, owner := range []string{"alice", ""} {
 		store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
 		h, task, _ := newWaitingTaskIn(t, owner, &mockAgentExecutor{}, store)
-		if _, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrUnauthenticated) {
+		if _, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrUnauthenticated) {
 			t.Errorf("UpdateTask() of %q's task error = %v, want ErrUnauthenticated", owner, err)
 		}
 		// The owner, also the anonymous one, still reaches the task, unchanged.
