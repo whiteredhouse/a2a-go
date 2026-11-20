@@ -351,13 +351,20 @@ func TestUpdateTaskCustomMaterializerSeesEarlierEvents(t *testing.T) {
 	}
 }
 
-// A store which knows only user names finds no task for the server: the
-// update does not reach a task it can't tell the owner of.
+// A store which knows only user names refuses the server, also for a task
+// of the anonymous user, whose name is empty as well.
 func TestUpdateTaskNeedsAStoreWhichKnowsTheServer(t *testing.T) {
-	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
-	h, task, _ := newWaitingTaskIn(t, "alice", &mockAgentExecutor{}, store)
-	if _, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Errorf("UpdateTask() error = %v, want ErrTaskNotFound", err)
+	for _, owner := range []string{"alice", ""} {
+		store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+		h, task, _ := newWaitingTaskIn(t, owner, &mockAgentExecutor{}, store)
+		if _, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrUnauthenticated) {
+			t.Errorf("UpdateTask() of %q's task error = %v, want ErrUnauthenticated", owner, err)
+		}
+		// The owner, also the anonymous one, still reaches the task, unchanged.
+		got, err := store.Get(asUser(owner), task.ID)
+		if err != nil || got.Task.Status.State != a2a.TaskStateInputRequired {
+			t.Errorf("Get() as owner %q = %v %v, want the task still waiting", owner, got, err)
+		}
 	}
 }
 

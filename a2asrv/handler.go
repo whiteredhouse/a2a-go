@@ -302,7 +302,7 @@ var ErrTaskActive = taskexec.ErrExecutionActive
 // to clients and runs no call interceptors. It is made as the server's own
 // call ([NewServerCallContext]), which reaches the task whoever owns it in a store
 // that tells the server apart ([taskstore.Caller.Server]), as the default
-// in-memory store does; in a store that doesn't, it finds no task.
+// in-memory store does; a store that doesn't refuses it.
 type TaskUpdater interface {
 	// UpdateTask publishes events to the task with the given ID through the
 	// same pipeline as the events of an execution: the task store and push

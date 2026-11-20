@@ -16,6 +16,7 @@ package a2asrv
 
 import (
 	"context"
+	"fmt"
 	"iter"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -132,9 +133,15 @@ type CallInterceptor interface {
 }
 
 // NewTaskStoreAuthenticator returns a taskstore.Authenticator which uses the CallContext to get the user name.
+// A name can't stand for the agent server's own calls ([NewServerCallContext]), so it refuses them: a store
+// needs [NewTaskStoreCallerAuthenticator] to serve them. A custom Authenticator should refuse them too, or
+// the server's calls reach the tasks of the user whose name it returns for them.
 func NewTaskStoreAuthenticator() taskstore.Authenticator {
 	return func(ctx context.Context) (string, error) {
 		if callCtx, ok := CallContextFrom(ctx); ok {
+			if callCtx.IsServer() {
+				return "", fmt.Errorf("the server's own call has no user name: %w", a2a.ErrUnauthenticated)
+			}
 			return callCtx.User.Name, nil
 		}
 		return "", a2a.ErrUnauthenticated
