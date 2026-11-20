@@ -55,6 +55,25 @@ type CallContext struct {
 
 	// tenant is an optional ID of the agent owner.
 	tenant string
+
+	// server is set only for the agent server's own calls ([NewServerCallContext]),
+	// so no request can claim it.
+	server bool
+}
+
+// NewServerCallContext returns ctx with the call context of the agent server's
+// own call, made for the agent rather than for a user, such as
+// [TaskUpdater.UpdateTask]. A task store which tells the server apart, as the
+// one of [NewTaskStoreCallerAuthenticator] does, gives it every task, and a task
+// keeps its owner when the server updates it.
+func NewServerCallContext(ctx context.Context) (context.Context, *CallContext) {
+	callCtx := &CallContext{User: &User{Authenticated: true}, server: true}
+	return context.WithValue(ctx, callContextKeyType{}, callCtx), callCtx
+}
+
+// IsServer reports whether the call is the agent server's own ([NewServerCallContext]).
+func (cc *CallContext) IsServer() bool {
+	return cc != nil && cc.server
 }
 
 // Method returns the name of the RequestHandler method which is being executed.
@@ -119,6 +138,18 @@ func NewTaskStoreAuthenticator() taskstore.Authenticator {
 			return callCtx.User.Name, nil
 		}
 		return "", a2a.ErrUnauthenticated
+	}
+}
+
+// NewTaskStoreCallerAuthenticator returns a taskstore.CallerAuthenticator
+// which uses the CallContext to get the user, and tells the agent server's
+// own calls ([NewServerCallContext]) apart.
+func NewTaskStoreCallerAuthenticator() taskstore.CallerAuthenticator {
+	return func(ctx context.Context) (taskstore.Caller, error) {
+		if callCtx, ok := CallContextFrom(ctx); ok {
+			return taskstore.Caller{Name: callCtx.User.Name, Server: callCtx.IsServer()}, nil
+		}
+		return taskstore.Caller{}, a2a.ErrUnauthenticated
 	}
 }
 

@@ -35,13 +35,28 @@ func asUser(name string) context.Context {
 	return ctx
 }
 
+// newUpdaterStore makes a store which knows its owners' tasks and the
+// server's own calls apart, as the handler's default store does.
+func newUpdaterStore() *taskstore.InMemory {
+	return taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
+		Authenticator:       NewTaskStoreAuthenticator(),
+		CallerAuthenticator: NewTaskStoreCallerAuthenticator(),
+	})
+}
+
+// asServer runs a call as the agent server itself.
+func asServer() context.Context {
+	ctx, _ := NewServerCallContext(context.Background())
+	return ctx
+}
+
 // newWaitingTask makes a handler whose agent runs execute for a message to
 // the task, and a task of owner's that waits for input. The task is put into
 // the store directly, so no execution of it is still being torn down when the
 // test starts.
 func newWaitingTask(t *testing.T, owner string, execute func(context.Context, *ExecutorContext) iter.Seq2[a2a.Event, error]) (RequestHandler, *a2a.Task) {
 	t.Helper()
-	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	store := newUpdaterStore()
 	h, task, _ := newWaitingTaskIn(t, owner, &mockAgentExecutor{ExecuteFunc: execute}, store)
 	return h, task
 }
@@ -186,7 +201,7 @@ type blockingStore struct {
 }
 
 func (s *blockingStore) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.StoredTask, error) {
-	if taskstore.IsServerAccess(ctx) {
+	if callCtx, ok := CallContextFrom(ctx); ok && callCtx.IsServer() {
 		close(s.reading)
 		<-s.release
 	}
@@ -197,7 +212,7 @@ func (s *blockingStore) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.
 // and a retry sees the task the update ended.
 func TestUpdateTaskHoldsTheTaskUntilItEnds(t *testing.T) {
 	store := &blockingStore{
-		Store:   taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()}),
+		Store:   newUpdaterStore(),
 		reading: make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -265,7 +280,7 @@ func (s *replyingSender) SendPush(ctx context.Context, config *a2a.PushConfig, e
 // A recipient which answers a pushed update before acknowledging it does
 // not deadlock the update.
 func TestUpdateTaskPushRecipientMayAnswer(t *testing.T) {
-	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	store := newUpdaterStore()
 	pushes := push.NewInMemoryStore()
 	sender := &replyingSender{replied: make(chan error, 1)}
 	agent := &mockAgentExecutor{}
@@ -295,7 +310,7 @@ func TestUpdateTaskPushRecipientMayAnswer(t *testing.T) {
 
 // An update runs none of the agent's execution cleanup.
 func TestUpdateTaskRunsNoExecutionCleanup(t *testing.T) {
-	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	store := newUpdaterStore()
 	cleaned := false
 	agent := &mockAgentExecutor{CleanupFn: func(context.Context, a2a.SendMessageResult, error) { cleaned = true }}
 	h, task, _ := newWaitingTaskIn(t, "alice", agent, store)
@@ -310,10 +325,10 @@ func TestUpdateTaskRunsNoExecutionCleanup(t *testing.T) {
 // A custom materializer runs only as each event is written, so it may
 // depend on what the store holds by then.
 func TestUpdateTaskCustomMaterializerSeesEarlierEvents(t *testing.T) {
-	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	store := newUpdaterStore()
 	materializer := taskstore.NewFullUpdateMaterializer(func(task *a2a.Task, event a2a.Event) (*a2a.Task, error) {
 		if e, ok := event.(*a2a.TaskStatusUpdateEvent); ok && e.Status.State == a2a.TaskStateCompleted {
-			stored, err := store.Get(taskstore.WithServerAccess(context.Background()), task.ID)
+			stored, err := store.Get(asServer(), task.ID)
 			if err != nil {
 				return nil, err
 			}
@@ -333,5 +348,28 @@ func TestUpdateTaskCustomMaterializerSeesEarlierEvents(t *testing.T) {
 		a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil))
 	if err != nil || got.Status.State != a2a.TaskStateCompleted {
 		t.Fatalf("UpdateTask() = %v %v, want completed", got, err)
+	}
+}
+
+// A store which knows only user names finds no task for the server: the
+// update does not reach a task it can't tell the owner of.
+func TestUpdateTaskNeedsAStoreWhichKnowsTheServer(t *testing.T) {
+	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	h, task, _ := newWaitingTaskIn(t, "alice", &mockAgentExecutor{}, store)
+	if _, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Errorf("UpdateTask() error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+// A request can't make itself the server: only NewServerCallContext makes it.
+func TestServerCallCannotBeClaimed(t *testing.T) {
+	_, callCtx := NewCallContext(context.Background(), nil)
+	callCtx.User = NewAuthenticatedUser("server", nil)
+	var none *CallContext
+	if callCtx.IsServer() || none.IsServer() {
+		t.Error("a request's call context is the server's")
+	}
+	if _, server := NewServerCallContext(context.Background()); !server.IsServer() {
+		t.Error("NewServerCallContext() is not the server's")
 	}
 }

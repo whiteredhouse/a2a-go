@@ -233,7 +233,8 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 
 	if h.workQueue == nil && h.taskStore == nil {
 		h.taskStore = taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-			Authenticator: NewTaskStoreAuthenticator(),
+			Authenticator:       NewTaskStoreAuthenticator(),
+			CallerAuthenticator: NewTaskStoreCallerAuthenticator(),
 		})
 	}
 	if h.taskStore != nil {
@@ -298,8 +299,10 @@ var ErrTaskActive = taskexec.ErrExecutionActive
 // returns. It lets the agent publish events to one of its tasks outside a
 // request, such as ending a task which waits for input when the input does not
 // come in time. It is the server's own call, not a caller's: it is not served
-// to clients, it runs no call interceptors, and it reaches the task whoever
-// owns it (see [taskstore.WithServerAccess]).
+// to clients and runs no call interceptors. It is made as the server's own
+// call ([NewServerCallContext]), which reaches the task whoever owns it in a store
+// that tells the server apart ([taskstore.Caller.Server]), as the default
+// in-memory store does; in a store that doesn't, it finds no task.
 type TaskUpdater interface {
 	// UpdateTask publishes events to the task with the given ID through the
 	// same pipeline as the events of an execution: the task store and push
@@ -321,7 +324,7 @@ func (h *defaultRequestHandler) UpdateTask(ctx context.Context, taskID a2a.TaskI
 	if taskID == "" {
 		return nil, fmt.Errorf("missing TaskID: %w", a2a.ErrInvalidParams)
 	}
-	ctx = taskstore.WithServerAccess(ctx)
+	ctx, _ = NewServerCallContext(ctx)
 	task, err := h.execManager.Update(ctx, &taskexec.UpdateRequest{TaskID: taskID, Events: events})
 	if err != nil {
 		return nil, fmt.Errorf("failed to update: %w", err)

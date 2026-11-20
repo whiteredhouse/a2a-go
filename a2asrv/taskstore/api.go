@@ -79,22 +79,20 @@ type UpdateRequest struct {
 	PrevVersion TaskVersion
 }
 
-type serverAccessKey struct{}
-
-// WithServerAccess marks ctx as the server's own access to the store, made for
-// the agent rather than for a caller, such as an update the agent publishes to
-// a task outside a request ([a2asrv.TaskUpdater]). A store gives it every task,
-// whoever owns it, and keeps the task's owner on update. Stores which check
-// ownership must honor it.
-func WithServerAccess(ctx context.Context) context.Context {
-	return context.WithValue(ctx, serverAccessKey{}, true)
+// Caller is the identity a store call is made for.
+type Caller struct {
+	// Name is the user the call is made for. A task belongs to the user who
+	// created it, and other users don't see it.
+	Name string
+	// Server is true for the agent server's own calls, made for the agent
+	// rather than for a user, such as an update the agent publishes to a task
+	// outside a request ([a2asrv.TaskUpdater]). A store gives the server every
+	// task, and the task keeps its owner when the server updates it.
+	Server bool
 }
 
-// IsServerAccess reports whether ctx was marked with [WithServerAccess].
-func IsServerAccess(ctx context.Context) bool {
-	v, _ := ctx.Value(serverAccessKey{}).(bool)
-	return v
-}
+// CallerAuthenticator returns the identity a store call is made for.
+type CallerAuthenticator func(context.Context) (Caller, error)
 
 // Store is an interface the server stack uses for storing and retrieving tasks.
 type Store interface {

@@ -578,32 +578,36 @@ func TestInMemoryTaskStore_CrossTenantIsolation(t *testing.T) {
 	}
 }
 
-func TestInMemoryTaskStore_ServerAccess(t *testing.T) {
-	type userKey struct{}
-	store := NewInMemory(&InMemoryStoreConfig{Authenticator: func(ctx context.Context) (string, error) {
-		if name, ok := ctx.Value(userKey{}).(string); ok {
-			return name, nil
+func TestInMemoryTaskStore_ServerCaller(t *testing.T) {
+	type callerKey struct{}
+	store := NewInMemory(&InMemoryStoreConfig{CallerAuthenticator: func(ctx context.Context) (Caller, error) {
+		if caller, ok := ctx.Value(callerKey{}).(Caller); ok {
+			return caller, nil
 		}
-		return "", a2a.ErrUnauthenticated
+		return Caller{}, a2a.ErrUnauthenticated
 	}})
-	owner := context.WithValue(context.Background(), userKey{}, "alice")
+	owner := context.WithValue(context.Background(), callerKey{}, Caller{Name: "alice"})
+	other := context.WithValue(context.Background(), callerKey{}, Caller{Name: "mallory"})
+	server := context.WithValue(context.Background(), callerKey{}, Caller{Server: true})
 	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateInputRequired}}
 	version, err := store.Create(owner, task)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if _, err := store.Get(context.Background(), task.ID); err == nil {
-		t.Fatal("Get() without a user succeeded")
+	if _, err := store.Get(other, task.ID); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("Get() as another user error = %v, want ErrTaskNotFound", err)
 	}
-	server := WithServerAccess(context.Background())
 	stored, err := store.Get(server, task.ID)
 	if err != nil || stored.User != "alice" {
-		t.Fatalf("Get() with server access = %v, %v, want alice's task", stored, err)
+		t.Fatalf("Get() as the server = %v, %v, want alice's task", stored, err)
 	}
 	updated := *task
 	updated.Status = a2a.TaskStatus{State: a2a.TaskStateFailed}
+	if _, err := store.Update(other, &UpdateRequest{Task: &updated, PrevTask: task, PrevVersion: version}); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("Update() as another user error = %v, want ErrTaskNotFound", err)
+	}
 	if _, err := store.Update(server, &UpdateRequest{Task: &updated, PrevTask: task, PrevVersion: version}); err != nil {
-		t.Fatalf("Update() with server access error = %v", err)
+		t.Fatalf("Update() as the server error = %v", err)
 	}
 	// The owner keeps the task.
 	stored, err = store.Get(owner, task.ID)
