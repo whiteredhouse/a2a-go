@@ -279,8 +279,8 @@ func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (
 // update holds the task, under the lock which admits executions and
 // cancelations, until it ends: an execution or cancelation which comes in the
 // meantime is refused with [ErrUpdateInProgress], and a retry sees the
-// update's result. An event the processor could not apply fails the update,
-// even when the processor recorded it as a failed task.
+// update's result. A failure the processor reports with its result fails the
+// update, which then returns both: the task as stored, and the failure.
 func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error) {
 	tid := req.TaskID
 	m.mu.Lock()
@@ -339,12 +339,14 @@ func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Tas
 	if err != nil {
 		return nil, fmt.Errorf("update failed: %w", err)
 	}
-	if failure != nil {
-		return nil, fmt.Errorf("update failed, an event could not be applied: %w", failure)
-	}
 	task, ok := result.(*a2a.Task)
 	if !ok {
 		return nil, fmt.Errorf("bug: update result was %T, not a task", result)
+	}
+	if failure != nil {
+		// The task is what the store holds after the update, so the caller
+		// can tell what was written.
+		return task, fmt.Errorf("update failed: %w", failure)
 	}
 	return task, nil
 }

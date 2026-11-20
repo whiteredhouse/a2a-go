@@ -42,12 +42,6 @@ func newUpdaterStore() *taskstore.InMemory {
 	})
 }
 
-// asServer runs a call as the agent server itself.
-func asServer() context.Context {
-	ctx, _ := NewServerCallContext(context.Background())
-	return ctx
-}
-
 // newWaitingTask makes a handler whose agent runs execute for a message to
 // the task, and a task of owner's that waits for input. The task is put into
 // the store directly, so no execution of it is still being torn down when the
@@ -336,5 +330,40 @@ func TestServerCallCannotBeClaimed(t *testing.T) {
 	}
 	if _, server := NewServerCallContext(context.Background()); !server.IsServer() {
 		t.Error("NewServerCallContext() is not the server's")
+	}
+}
+
+// failingSender fails every push notification, as an unreachable webhook does.
+type failingSender struct{}
+
+func (failingSender) SendPush(context.Context, *a2a.PushConfig, a2a.Event) error {
+	return errors.New("webhook unreachable")
+}
+
+// A push notification which is not delivered leaves the update standing, and
+// the caller can tell it from a refused update.
+func TestUpdateTaskKeepsTheUpdateWhenPushFails(t *testing.T) {
+	for _, state := range []a2a.TaskState{a2a.TaskStateCompleted, a2a.TaskStateInputRequired} {
+		store := newUpdaterStore()
+		pushes := push.NewInMemoryStore()
+		task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
+		if _, err := store.Create(asUser("alice"), task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pushes.Save(asUser("alice"), task.ID, &a2a.PushConfig{URL: "https://example.com/push"}); err != nil {
+			t.Fatal(err)
+		}
+		h := NewHandler(&mockAgentExecutor{}, WithTaskStore(store), WithPushNotifications(pushes, failingSender{}))
+		got, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, state, nil))
+		if !errors.Is(err, ErrPushNotDelivered) {
+			t.Errorf("UpdateTask(%v) error = %v, want ErrPushNotDelivered", state, err)
+		}
+		if got == nil || got.Status.State != state {
+			t.Errorf("UpdateTask(%v) task = %v, want the stored update", state, got)
+		}
+		stored, err := h.GetTask(asUser("alice"), &a2a.GetTaskRequest{ID: task.ID})
+		if err != nil || stored.Status.State != state {
+			t.Errorf("GetTask() after UpdateTask(%v) = %v %v, want the update stored", state, stored, err)
+		}
 	}
 }

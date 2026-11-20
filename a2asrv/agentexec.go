@@ -385,6 +385,7 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 		return nil, nil, nil, fmt.Errorf("taskupdate manager: %w", err)
 	}
 	processor := newProcessor(updateManager, f.pushConfigStore, f.pushDelivery, execCtx, f.taskStore)
+	processor.keepOnPushFailure = true
 	// No cleaner: the agent's execution cleanup hooks run after its Execute
 	// and Cancel calls, and an update makes neither.
 	return &updater{event: event}, processor, nil, nil
@@ -508,6 +509,11 @@ type processor struct {
 	pushDelivery    push.DeliveryHandler
 	execCtx         *ExecutorContext
 	store           taskstore.Store
+	// keepOnPushFailure keeps a stored event when its push notification is not
+	// delivered, and reports the failure as [ErrPushNotDelivered], instead of
+	// failing the task. An update ([TaskUpdater.UpdateTask]) sets it: its event is
+	// written whole, and a webhook can't undo it.
+	keepOnPushFailure bool
 }
 
 var _ taskexec.Processor = (*processor)(nil)
@@ -566,6 +572,14 @@ func (p *processor) Process(ctx context.Context, event a2a.Event) (*taskexec.Pro
 	}
 
 	if err := p.sendPushNotifications(ctx, event); err != nil {
+		if p.keepOnPushFailure && a2aevent.IsFinal(event) {
+			result, loadErr := p.loadResult(ctx)
+			if loadErr != nil {
+				return nil, fmt.Errorf("load result: %w: %w", loadErr, err)
+			}
+			result.ExecutionFailureCause = fmt.Errorf("%w: %w", ErrPushNotDelivered, err)
+			return result, nil
+		}
 		return p.setTaskFailed(ctx, err)
 	}
 

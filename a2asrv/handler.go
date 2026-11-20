@@ -289,6 +289,11 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 	return ih
 }
 
+// ErrPushNotDelivered is returned by [TaskUpdater.UpdateTask] when the update
+// was stored but a push notification of it was not delivered. UpdateTask then
+// returns the stored task too: the update stands.
+var ErrPushNotDelivered = errors.New("the update was stored, but its push notification was not delivered")
+
 // ErrTaskActive is returned by [TaskUpdater.UpdateTask] when the task has an
 // active execution, cancelation or update. The update may be retried once it
 // ends.
@@ -313,7 +318,10 @@ type TaskUpdater interface {
 	// execution its agent publishes the events itself. A message or
 	// cancelation of the task which comes during the update is refused as
 	// busy, and may be retried. UpdateTask returns the task the event results
-	// in. It is not supported in cluster mode ([WithClusterMode]) yet.
+	// in. When the event was stored but its push notification was not
+	// delivered, it returns that task with [ErrPushNotDelivered]: the update
+	// stands, and only the delivery failed. It is not supported in cluster
+	// mode ([WithClusterMode]) yet.
 	UpdateTask(ctx context.Context, event *a2a.TaskStatusUpdateEvent) (*a2a.Task, error)
 }
 
@@ -325,7 +333,7 @@ func (h *defaultRequestHandler) UpdateTask(ctx context.Context, event *a2a.TaskS
 	ctx, _ = NewServerCallContext(ctx)
 	task, err := h.execManager.Update(ctx, &taskexec.UpdateRequest{TaskID: event.TaskID, Event: event})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update: %w", err)
+		return task, fmt.Errorf("failed to update: %w", err)
 	}
 	return task, nil
 }
