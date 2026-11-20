@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aevent"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
@@ -303,5 +304,34 @@ func TestUpdateTaskRunsNoExecutionCleanup(t *testing.T) {
 	}
 	if cleaned {
 		t.Error("an update ran the agent's execution cleanup")
+	}
+}
+
+// A custom materializer runs only as each event is written, so it may
+// depend on what the store holds by then.
+func TestUpdateTaskCustomMaterializerSeesEarlierEvents(t *testing.T) {
+	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	materializer := taskstore.NewFullUpdateMaterializer(func(task *a2a.Task, event a2a.Event) (*a2a.Task, error) {
+		if e, ok := event.(*a2a.TaskStatusUpdateEvent); ok && e.Status.State == a2a.TaskStateCompleted {
+			stored, err := store.Get(taskstore.WithServerAccess(context.Background()), task.ID)
+			if err != nil {
+				return nil, err
+			}
+			if len(stored.Task.Artifacts) == 0 {
+				return nil, errors.New("completed before its artifact was stored")
+			}
+		}
+		return a2aevent.ApplyShallowUpdate(task, event)
+	})
+	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateInputRequired}}
+	if _, err := store.Create(asUser("alice"), task); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(&mockAgentExecutor{}, WithTaskStore(store), WithUpdateMaterializer(materializer))
+	got, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID,
+		a2a.NewArtifactEvent(task, a2a.NewTextPart("result")),
+		a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil))
+	if err != nil || got.Status.State != a2a.TaskStateCompleted {
+		t.Fatalf("UpdateTask() = %v %v, want completed", got, err)
 	}
 }
