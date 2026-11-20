@@ -285,7 +285,7 @@ func TestREST_Validations(t *testing.T) {
 		},
 	}
 	store := testutil.NewTestTaskStoreWithConfig(&taskstore.InMemoryStoreConfig{
-		Authenticator: authenticator,
+		CallerAuthenticator: TaskStoreCallerFromName(authenticator),
 	}).WithTasks(t, task)
 	pushstore := testutil.NewTestPushConfigStore()
 	pushsender := testutil.NewTestPushSender(t).SetSendPushError(nil)
@@ -491,7 +491,7 @@ func TestREST_ListTasksParseErrors(t *testing.T) {
 
 	auth := func(ctx context.Context) (string, error) { return "TestUser", nil }
 	store := testutil.NewTestTaskStoreWithConfig(&taskstore.InMemoryStoreConfig{
-		Authenticator: auth,
+		CallerAuthenticator: TaskStoreCallerFromName(auth),
 	})
 	reqHandler := NewHandler(&mockAgentExecutor{}, WithTaskStore(store))
 	server := httptest.NewServer(NewRESTHandler(reqHandler))

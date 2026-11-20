@@ -36,14 +36,21 @@ type storedTask struct {
 }
 
 // Authenticator is a function that returns the name of the user who created the task.
+//
+// Deprecated: Use [CallerAuthenticator], which also tells the agent server's own calls apart.
 type Authenticator func(context.Context) (string, error)
 
 // InMemoryStoreConfig is a configuration for [InMemory] store.
 type InMemoryStoreConfig struct {
+	// Authenticator returns the name of the user a call is made for. It is
+	// used only when CallerAuthenticator is nil.
+	//
+	// Deprecated: Use CallerAuthenticator.
 	Authenticator Authenticator
-	// CallerAuthenticator, when set, is used instead of Authenticator. It also
-	// tells the server's own calls apart ([Caller.Server]), which may reach
-	// every task.
+	// CallerAuthenticator returns who a call is made for: a user, whose tasks
+	// only they reach, or the agent server itself ([Caller.Server]), which
+	// reaches every task. Without it (and Authenticator), every call is the
+	// anonymous user's.
 	CallerAuthenticator CallerAuthenticator
 	TimeProvider        func() time.Time
 }
@@ -73,9 +80,14 @@ func NewInMemory(config *InMemoryStoreConfig) *InMemory {
 		}
 	}
 
-	if m.config.Authenticator == nil {
-		m.config.Authenticator = func(ctx context.Context) (string, error) {
-			return "", nil
+	if m.config.CallerAuthenticator == nil {
+		name := m.config.Authenticator
+		m.config.CallerAuthenticator = func(ctx context.Context) (Caller, error) {
+			if name == nil {
+				return Caller{}, nil
+			}
+			n, err := name(ctx)
+			return Caller{Name: n}, err
 		}
 	}
 
@@ -84,11 +96,7 @@ func NewInMemory(config *InMemoryStoreConfig) *InMemory {
 
 // caller returns the identity a call is made for.
 func (s *InMemory) caller(ctx context.Context) (Caller, error) {
-	if s.config.CallerAuthenticator != nil {
-		return s.config.CallerAuthenticator(ctx)
-	}
-	name, err := s.config.Authenticator(ctx)
-	return Caller{Name: name}, err
+	return s.config.CallerAuthenticator(ctx)
 }
 
 // owns reports whether the caller may reach a task of owner's.

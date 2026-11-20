@@ -286,7 +286,7 @@ func TestJSONRPC_Validations(t *testing.T) {
 	}
 
 	store := testutil.NewTestTaskStoreWithConfig(&taskstore.InMemoryStoreConfig{
-		Authenticator: auth,
+		CallerAuthenticator: TaskStoreCallerFromName(auth),
 	}).WithTasks(t, task)
 	reqHandler := NewHandler(&mockAgentExecutor{}, WithTaskStore(store))
 	server := httptest.NewServer(NewJSONRPCHandler(reqHandler))

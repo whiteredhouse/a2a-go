@@ -133,9 +133,9 @@ type CallInterceptor interface {
 }
 
 // NewTaskStoreAuthenticator returns a taskstore.Authenticator which uses the CallContext to get the user name.
-// A name can't stand for the agent server's own calls ([NewServerCallContext]), so it refuses them: a store
-// needs [NewTaskStoreCallerAuthenticator] to serve them. A custom Authenticator should refuse them too, or
-// the server's calls reach the tasks of the user whose name it returns for them.
+// A name can't stand for the agent server's own calls ([NewServerCallContext]), so it refuses them.
+//
+// Deprecated: Use [NewTaskStoreCallerAuthenticator], which serves the server's own calls too.
 func NewTaskStoreAuthenticator() taskstore.Authenticator {
 	return func(ctx context.Context) (string, error) {
 		if callCtx, ok := CallContextFrom(ctx); ok {
@@ -157,6 +157,20 @@ func NewTaskStoreCallerAuthenticator() taskstore.CallerAuthenticator {
 			return taskstore.Caller{Name: callCtx.User.Name, Server: callCtx.IsServer()}, nil
 		}
 		return taskstore.Caller{}, a2a.ErrUnauthenticated
+	}
+}
+
+// TaskStoreCallerFromName returns a taskstore.CallerAuthenticator for a
+// function which knows only user names, such as one of a fixed identity. It
+// refuses the agent server's own calls ([NewServerCallContext]) without
+// calling it, since a name can't stand for the server.
+func TaskStoreCallerFromName(name func(context.Context) (string, error)) taskstore.CallerAuthenticator {
+	return func(ctx context.Context) (taskstore.Caller, error) {
+		if callCtx, ok := CallContextFrom(ctx); ok && callCtx.IsServer() {
+			return taskstore.Caller{}, fmt.Errorf("the server's own call has no user name: %w", a2a.ErrUnauthenticated)
+		}
+		n, err := name(ctx)
+		return taskstore.Caller{Name: n}, err
 	}
 }
 

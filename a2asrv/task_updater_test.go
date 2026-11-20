@@ -38,7 +38,6 @@ func asUser(name string) context.Context {
 // server's own calls apart, as the handler's default store does.
 func newUpdaterStore() *taskstore.InMemory {
 	return taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-		Authenticator:       NewTaskStoreAuthenticator(),
 		CallerAuthenticator: NewTaskStoreCallerAuthenticator(),
 	})
 }
@@ -297,16 +296,32 @@ func TestUpdateTaskRunsNoExecutionCleanup(t *testing.T) {
 // A store which knows only user names refuses the server, also for a task
 // of the anonymous user, whose name is empty as well.
 func TestUpdateTaskNeedsAStoreWhichKnowsTheServer(t *testing.T) {
-	for _, owner := range []string{"alice", ""} {
-		store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
-		h, task, _ := newWaitingTaskIn(t, owner, &mockAgentExecutor{}, store)
-		if _, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrUnauthenticated) {
-			t.Errorf("UpdateTask() of %q's task error = %v, want ErrUnauthenticated", owner, err)
+	byName := func(ctx context.Context) (string, error) {
+		if callCtx, ok := CallContextFrom(ctx); ok {
+			return callCtx.User.Name, nil
 		}
-		// The owner, also the anonymous one, still reaches the task, unchanged.
-		got, err := store.Get(asUser(owner), task.ID)
-		if err != nil || got.Task.Status.State != a2a.TaskStateInputRequired {
-			t.Errorf("Get() as owner %q = %v %v, want the task still waiting", owner, got, err)
+		return "", a2a.ErrUnauthenticated
+	}
+	configs := map[string]func() *taskstore.InMemoryStoreConfig{
+		"caller from name": func() *taskstore.InMemoryStoreConfig {
+			return &taskstore.InMemoryStoreConfig{CallerAuthenticator: TaskStoreCallerFromName(byName)}
+		},
+		"deprecated name authenticator": func() *taskstore.InMemoryStoreConfig {
+			return &taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()} //nolint:staticcheck // the deprecated path must refuse the server too
+		},
+	}
+	for name, config := range configs {
+		for _, owner := range []string{"alice", ""} {
+			store := taskstore.NewInMemory(config())
+			h, task, _ := newWaitingTaskIn(t, owner, &mockAgentExecutor{}, store)
+			if _, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)); !errors.Is(err, a2a.ErrUnauthenticated) {
+				t.Errorf("%s: UpdateTask() of %q's task error = %v, want ErrUnauthenticated", name, owner, err)
+			}
+			// The owner, also the anonymous one, still reaches the task, unchanged.
+			got, err := store.Get(asUser(owner), task.ID)
+			if err != nil || got.Task.Status.State != a2a.TaskStateInputRequired {
+				t.Errorf("%s: Get() as owner %q = %v %v, want the task still waiting", name, owner, got, err)
+			}
 		}
 	}
 }

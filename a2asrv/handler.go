@@ -233,7 +233,6 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 
 	if h.workQueue == nil && h.taskStore == nil {
 		h.taskStore = taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-			Authenticator:       NewTaskStoreAuthenticator(),
 			CallerAuthenticator: NewTaskStoreCallerAuthenticator(),
 		})
 	}
