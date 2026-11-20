@@ -39,8 +39,9 @@ var (
 	// a Task concurrently with its cancelation.
 	ErrCancelationInProgress = a2a.NewError(a2a.ErrUnsupportedOperation, "task cancelation is in progress")
 	// ErrUpdateInProgress is returned when a caller attempts to start an execution or a
-	// cancelation of a Task while the agent publishes an update to it, and the update
-	// did not end before the call was admitted.
+	// cancelation of a Task while the agent publishes an update to it. The call may be
+	// retried: it is refused rather than queued, because the update may be delivering a
+	// push notification whose recipient answers before acknowledging it.
 	ErrUpdateInProgress = a2a.NewError(a2a.ErrUnsupportedOperation, "task update is in progress")
 )
 
@@ -163,10 +164,6 @@ func (m *localManager) Execute(ctx context.Context, req *a2a.SendMessageRequest)
 		tid = a2a.NewTaskID()
 	} else {
 		tid = req.Message.TaskID
-		// a message which comes while the agent updates the task sees the update's result
-		if err := m.waitForUpdate(ctx, tid); err != nil {
-			return nil, err
-		}
 		// handle fast client sending a follow-up message before execution was unregistered
 		if err := m.waitForExiting(ctx, tid); err != nil {
 			return nil, err
@@ -195,22 +192,6 @@ func (m *localManager) Execute(ctx context.Context, req *a2a.SendMessageRequest)
 	go m.handleExecution(detachedCtx, execution, eventBroadcastQueue)
 
 	return newLocalSubscription(execution, defaultSubReadQueue), nil
-}
-
-// waitForUpdate waits for an update of the task in progress, if any, to end.
-func (m *localManager) waitForUpdate(ctx context.Context, tid a2a.TaskID) error {
-	m.mu.Lock()
-	done := m.updates[tid]
-	m.mu.Unlock()
-	if done == nil {
-		return nil
-	}
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func (m *localManager) waitForExiting(ctx context.Context, tid a2a.TaskID) error {
@@ -262,10 +243,6 @@ func (m *localManager) createExecution(ctx context.Context, tid a2a.TaskID, req 
 // If there's no active Execution Canceler will be processing task events.
 func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error) {
 	tid := req.ID
-	// a cancelation which comes while the agent updates the task sees the update's result
-	if err := m.waitForUpdate(ctx, tid); err != nil {
-		return nil, err
-	}
 	m.mu.Lock()
 	if _, ok := m.updates[tid]; ok {
 		m.mu.Unlock()
@@ -301,7 +278,9 @@ func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (
 // [ErrExecutionActive]: its agent publishes events through that execution. The
 // update holds the task, under the lock which admits executions and
 // cancelations, until it ends: an execution or cancelation which comes in the
-// meantime waits for it and then sees its result.
+// meantime is refused with [ErrUpdateInProgress], and a retry sees the
+// update's result. An event the processor could not apply fails the update,
+// even when the processor recorded it as a failed task.
 func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error) {
 	tid := req.TaskID
 	m.mu.Lock()
@@ -330,9 +309,18 @@ func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Tas
 	pipe := eventpipe.NewLocal()
 	defer pipe.Close()
 
+	// The processor turns an event it can't apply into a failed task and a
+	// failure cause, which the result alone would hide.
+	var failure error
 	handler := &executionHandler{
-		agentEvents:   pipe.Reader,
-		handleEventFn: processor.Process,
+		agentEvents: pipe.Reader,
+		handleEventFn: func(ctx context.Context, event a2a.Event) (*ProcessorResult, error) {
+			res, err := processor.Process(ctx, event)
+			if err == nil && res != nil && res.ExecutionFailureCause != nil {
+				failure = res.ExecutionFailureCause
+			}
+			return res, err
+		},
 		handleErrorFn: func(ctx context.Context, err error) (a2a.SendMessageResult, error) { return nil, err },
 	}
 	result, err := runProducerConsumer(
@@ -350,6 +338,9 @@ func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Tas
 
 	if err != nil {
 		return nil, fmt.Errorf("update failed: %w", err)
+	}
+	if failure != nil {
+		return nil, fmt.Errorf("update failed, an event could not be applied: %w", failure)
 	}
 	task, ok := result.(*a2a.Task)
 	if !ok {

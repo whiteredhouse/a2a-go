@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
 
@@ -108,7 +109,16 @@ func TestUpdateTaskValidatesEvents(t *testing.T) {
 			a2a.NewStatusUpdateEvent(task, a2a.TaskStateInputRequired, nil),
 			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
 		},
-		"nil status":   {nilStatus},
+		"nil status": {nilStatus},
+		"empty artifact": {
+			a2a.NewArtifactEvent(task, a2a.NewTextPart("partial")),
+			a2a.NewArtifactEvent(task),
+			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
+		},
+		"nil artifact payload": {
+			&a2a.TaskArtifactUpdateEvent{TaskID: task.ID, ContextID: task.ContextID},
+			a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil),
+		},
 		"nil artifact": {nilArtifact, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil)},
 	} {
 		if _, err := updater.UpdateTask(context.Background(), task.ID, events...); !errors.Is(err, a2a.ErrInvalidParams) {
@@ -152,8 +162,8 @@ func TestUpdateTaskRefusesATaskWithAnActiveExecution(t *testing.T) {
 	<-started
 	_, err := h.(TaskUpdater).UpdateTask(context.Background(), task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateFailed, nil))
 	close(release)
-	if err == nil {
-		t.Error("UpdateTask() during an execution succeeded")
+	if !errors.Is(err, ErrTaskActive) {
+		t.Errorf("UpdateTask() during an execution error = %v, want ErrTaskActive", err)
 	}
 	if err := <-done; err != nil {
 		t.Errorf("the execution: %v", err)
@@ -176,8 +186,8 @@ func (s *blockingStore) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.
 	return s.Store.Get(ctx, taskID)
 }
 
-// A message which comes while an update is under way waits for it, and then
-// sees the task the update ended.
+// A message which comes while an update is under way is refused as busy,
+// and a retry sees the task the update ended.
 func TestUpdateTaskHoldsTheTaskUntilItEnds(t *testing.T) {
 	store := &blockingStore{
 		Store:   taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()}),
@@ -202,34 +212,74 @@ func TestUpdateTaskHoldsTheTaskUntilItEnds(t *testing.T) {
 
 	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("blue"))
 	answer.TaskID = task.ID
-	answered := make(chan error, 1)
-	go func() {
-		_, err := h.SendMessage(asUser("alice"), &a2a.SendMessageRequest{Message: answer})
-		answered <- err
-	}()
-	select {
-	case err := <-answered:
-		t.Fatalf("SendMessage() during an update returned %v before the update ended", err)
-	case <-executed:
-		t.Fatal("the answer executed during an update")
-	case <-time.After(100 * time.Millisecond):
+	if _, err := h.SendMessage(asUser("alice"), &a2a.SendMessageRequest{Message: answer}); !errors.Is(err, a2a.ErrUnsupportedOperation) {
+		t.Errorf("SendMessage() during an update error = %v, want a busy refusal", err)
+	}
+	if _, err := h.CancelTask(asUser("alice"), &a2a.CancelTaskRequest{ID: task.ID}); !errors.Is(err, a2a.ErrUnsupportedOperation) {
+		t.Errorf("CancelTask() during an update error = %v, want a busy refusal", err)
 	}
 
 	close(store.release)
 	if err := <-updated; err != nil {
 		t.Fatalf("UpdateTask() error = %v", err)
 	}
-	if err := <-answered; err == nil {
+	if _, err := h.SendMessage(asUser("alice"), &a2a.SendMessageRequest{Message: answer}); err == nil {
 		t.Error("SendMessage() to the task the update ended succeeded")
 	}
 	select {
 	case <-executed:
-		t.Error("the answer executed after the update ended the task")
+		t.Error("the answer executed")
 	default:
 	}
 	got, err := h.GetTask(asUser("alice"), &a2a.GetTaskRequest{ID: task.ID})
 	if err != nil || got.Status.State != a2a.TaskStateFailed {
 		t.Errorf("GetTask() = %v %v, want failed", got, err)
+	}
+}
+
+// replyingSender answers the task in each push notification before it
+// acknowledges it, as a synchronous recipient may.
+type replyingSender struct {
+	h       RequestHandler
+	replied chan error
+}
+
+func (s *replyingSender) SendPush(ctx context.Context, config *a2a.PushConfig, event a2a.Event) error {
+	answer := a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("blue"))
+	answer.TaskID = event.TaskInfo().TaskID
+	_, err := s.h.SendMessage(asUser("alice"), &a2a.SendMessageRequest{Message: answer})
+	s.replied <- err
+	return nil
+}
+
+// A recipient which answers a pushed update before acknowledging it does
+// not deadlock the update.
+func TestUpdateTaskPushRecipientMayAnswer(t *testing.T) {
+	store := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{Authenticator: NewTaskStoreAuthenticator()})
+	pushes := push.NewInMemoryStore()
+	sender := &replyingSender{replied: make(chan error, 1)}
+	agent := &mockAgentExecutor{}
+	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
+	if _, err := store.Create(asUser("alice"), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pushes.Save(asUser("alice"), task.ID, &a2a.PushConfig{URL: "https://example.com/push"}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(agent, WithTaskStore(store), WithPushNotifications(pushes, sender))
+	sender.h = h
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := h.(TaskUpdater).UpdateTask(ctx, task.ID, a2a.NewStatusUpdateEvent(task, a2a.TaskStateInputRequired, nil))
+	if err != nil {
+		t.Fatalf("UpdateTask() error = %v", err)
+	}
+	if got.Status.State != a2a.TaskStateInputRequired {
+		t.Errorf("UpdateTask() state = %v, want input required", got.Status.State)
+	}
+	if err := <-sender.replied; !errors.Is(err, a2a.ErrUnsupportedOperation) {
+		t.Errorf("the recipient's answer during the update: %v, want a busy refusal", err)
 	}
 }
 

@@ -289,6 +289,11 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 	return ih
 }
 
+// ErrTaskActive is returned by [TaskUpdater.UpdateTask] when the task has an
+// active execution, cancelation or update. The update may be retried once it
+// ends.
+var ErrTaskActive = taskexec.ErrExecutionActive
+
 // TaskUpdater is implemented by the request handler which [NewHandler]
 // returns. It lets the agent publish events to one of its tasks outside a
 // request, such as ending a task which waits for input when the input does not
@@ -300,9 +305,12 @@ type TaskUpdater interface {
 	// same pipeline as the events of an execution: the task store and push
 	// notifications. The events are status and artifact update events of that
 	// task, and the last one is final: it ends the task or interrupts it, as
-	// the last event of an execution does. A task which has ended, or which has
-	// an active execution or cancelation, is refused: during an execution its
-	// agent publishes the events itself. UpdateTask returns the task the
+	// the last event of an execution does. The whole batch is checked before
+	// anything is written. A task which has ended is refused, and a task with an
+	// active execution, cancelation or update is refused with [ErrTaskActive]:
+	// during an execution its agent publishes the events itself. A message or
+	// cancelation of the task which comes during the update is refused as busy,
+	// and may be retried. UpdateTask returns the task the
 	// events result in. It is not supported in cluster mode
 	// ([WithClusterMode]) yet.
 	UpdateTask(ctx context.Context, taskID a2a.TaskID, events ...a2a.Event) (*a2a.Task, error)

@@ -368,6 +368,9 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 			if e == nil {
 				return nil, nil, nil, fmt.Errorf("event %d of the update is nil: %w", i, a2a.ErrInvalidParams)
 			}
+			if e.Artifact == nil || len(e.Artifact.Parts) == 0 {
+				return nil, nil, nil, fmt.Errorf("event %d of the update has an empty artifact: %w", i, a2a.ErrInvalidParams)
+			}
 		default:
 			return nil, nil, nil, fmt.Errorf("an update takes only status and artifact update events, not %T: %w", event, a2a.ErrInvalidParams)
 		}
