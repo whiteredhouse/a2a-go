@@ -289,10 +289,15 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 	return ih
 }
 
+// ErrUpdateStored is wrapped by the error of [TaskUpdater.UpdateTask] when
+// the update was stored but a later step failed: the update stands. UpdateTask
+// then returns the stored task too, when it could read it back.
+var ErrUpdateStored = errors.New("the update was stored")
+
 // ErrPushNotDelivered is returned by [TaskUpdater.UpdateTask] when the update
-// was stored but a push notification of it was not delivered. UpdateTask then
-// returns the stored task too: the update stands.
-var ErrPushNotDelivered = errors.New("the update was stored, but its push notification was not delivered")
+// was stored but a push notification of it was not delivered. It wraps
+// [ErrUpdateStored], and UpdateTask returns the stored task with it.
+var ErrPushNotDelivered = fmt.Errorf("%w, but its push notification was not delivered", ErrUpdateStored)
 
 // ErrTaskActive is returned by [TaskUpdater.UpdateTask] when the task has an
 // active execution, cancelation or update. The update may be retried once it
@@ -318,9 +323,10 @@ type TaskUpdater interface {
 	// execution its agent publishes the events itself. A message or
 	// cancelation of the task which comes during the update is refused as
 	// busy, and may be retried. UpdateTask returns the task the event results
-	// in. When the event was stored but its push notification was not
-	// delivered, it returns that task with [ErrPushNotDelivered]: the update
-	// stands, and only the delivery failed. It is not supported in cluster
+	// in. When the event was stored but a later step failed, the error wraps
+	// [ErrUpdateStored]: the update stands. A push notification which was not
+	// delivered, by an error or a failed delivery result, or because ctx ended
+	// during delivery, gives [ErrPushNotDelivered] with the stored task. It is not supported in cluster
 	// mode ([WithClusterMode]) yet.
 	UpdateTask(ctx context.Context, event *a2a.TaskStatusUpdateEvent) (*a2a.Task, error)
 }

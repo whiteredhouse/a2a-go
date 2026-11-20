@@ -18,10 +18,13 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aevent"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/push"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
@@ -365,5 +368,70 @@ func TestUpdateTaskKeepsTheUpdateWhenPushFails(t *testing.T) {
 		if err != nil || stored.Status.State != state {
 			t.Errorf("GetTask() after UpdateTask(%v) = %v %v, want the update stored", state, stored, err)
 		}
+	}
+}
+
+// A sender which reports a failed delivery only in its result (the HTTP
+// sender without FailOnError) still fails the update's delivery.
+func TestUpdateTaskSeesFailedDeliveryResults(t *testing.T) {
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer webhook.Close()
+	store := newUpdaterStore()
+	pushes := push.NewInMemoryStore()
+	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
+	if _, err := store.Create(asUser("alice"), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pushes.Save(asUser("alice"), task.ID, &a2a.PushConfig{URL: webhook.URL}); err != nil {
+		t.Fatal(err)
+	}
+	sender := push.NewHTTPPushSender(&push.HTTPSenderConfig{AllowPrivateNetworks: true})
+	h := NewHandler(&mockAgentExecutor{}, WithTaskStore(store), WithPushNotifications(pushes, sender))
+	got, err := h.(TaskUpdater).UpdateTask(context.Background(), a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil))
+	if !errors.Is(err, ErrPushNotDelivered) || got == nil || got.Status.State != a2a.TaskStateCompleted {
+		t.Errorf("UpdateTask() = %v, %v, want the completed task with ErrPushNotDelivered", got, err)
+	}
+}
+
+// cancelingSender ends the update's call while it delivers.
+type cancelingSender struct{ cancel context.CancelFunc }
+
+func (s cancelingSender) SendPush(ctx context.Context, _ *a2a.PushConfig, _ a2a.Event) error {
+	s.cancel()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// contextStore honours the cancelation of its calls, as a database would.
+type contextStore struct{ taskstore.Store }
+
+func (s contextStore) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.StoredTask, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.Get(ctx, taskID)
+}
+
+// A call which ends during delivery still learns the update was stored, also
+// when the materializer keeps no snapshot and the task is read back.
+func TestUpdateTaskCanceledDuringDeliveryKeepsTheUpdate(t *testing.T) {
+	store := contextStore{newUpdaterStore()}
+	pushes := push.NewInMemoryStore()
+	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateWorking}}
+	if _, err := store.Create(asUser("alice"), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pushes.Save(asUser("alice"), task.ID, &a2a.PushConfig{URL: "https://example.com/push"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := NewHandler(&mockAgentExecutor{}, WithTaskStore(store), WithPushNotifications(pushes, cancelingSender{cancel}),
+		WithUpdateMaterializer(taskstore.NewPartialUpdateMaterializer(a2aevent.ApplyShallowUpdate)))
+	got, err := h.(TaskUpdater).UpdateTask(ctx, a2a.NewStatusUpdateEvent(task, a2a.TaskStateCompleted, nil))
+	if !errors.Is(err, ErrPushNotDelivered) || !errors.Is(err, ErrUpdateStored) || got == nil || got.Status.State != a2a.TaskStateCompleted {
+		t.Errorf("UpdateTask() = %v, %v, want the completed task with ErrPushNotDelivered", got, err)
 	}
 }

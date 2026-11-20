@@ -385,7 +385,7 @@ func (f *factory) CreateUpdater(ctx context.Context, req *taskexec.UpdateRequest
 		return nil, nil, nil, fmt.Errorf("taskupdate manager: %w", err)
 	}
 	processor := newProcessor(updateManager, f.pushConfigStore, f.pushDelivery, execCtx, f.taskStore)
-	processor.keepOnPushFailure = true
+	processor.update = true
 	// No cleaner: the agent's execution cleanup hooks run after its Execute
 	// and Cancel calls, and an update makes neither.
 	return &updater{event: event}, processor, nil, nil
@@ -509,11 +509,9 @@ type processor struct {
 	pushDelivery    push.DeliveryHandler
 	execCtx         *ExecutorContext
 	store           taskstore.Store
-	// keepOnPushFailure keeps a stored event when its push notification is not
-	// delivered, and reports the failure as [ErrPushNotDelivered], instead of
-	// failing the task. An update ([TaskUpdater.UpdateTask]) sets it: its event is
-	// written whole, and a webhook can't undo it.
-	keepOnPushFailure bool
+	// update makes the processor handle the event of an update
+	// ([TaskUpdater.UpdateTask]) rather than of an execution (processUpdate).
+	update bool
 }
 
 var _ taskexec.Processor = (*processor)(nil)
@@ -532,6 +530,9 @@ func newProcessor(updateManager *taskupdate.Manager, pushStore push.ConfigStore,
 // A (nil, nil) result means the processing should continue.
 // A non-nill result becomes the result of the execution.
 func (p *processor) Process(ctx context.Context, event a2a.Event) (*taskexec.ProcessorResult, error) {
+	if p.update {
+		return p.processUpdate(ctx, event)
+	}
 	version, processingErr := p.updateManager.Process(ctx, event)
 
 	if processingErr != nil && errors.Is(processingErr, taskstore.ErrConcurrentModification) {
@@ -572,14 +573,6 @@ func (p *processor) Process(ctx context.Context, event a2a.Event) (*taskexec.Pro
 	}
 
 	if err := p.sendPushNotifications(ctx, event); err != nil {
-		if p.keepOnPushFailure && a2aevent.IsFinal(event) {
-			result, loadErr := p.loadResult(ctx)
-			if loadErr != nil {
-				return nil, fmt.Errorf("load result: %w: %w", loadErr, err)
-			}
-			result.ExecutionFailureCause = fmt.Errorf("%w: %w", ErrPushNotDelivered, err)
-			return result, nil
-		}
 		return p.setTaskFailed(ctx, err)
 	}
 
@@ -591,6 +584,51 @@ func (p *processor) Process(ctx context.Context, event a2a.Event) (*taskexec.Pro
 		return nil, fmt.Errorf("load result: %w", err)
 	}
 	return result, nil
+}
+
+// processUpdate stores the event of an update, then delivers its push
+// notifications. Unlike an execution's, a failure after the event is stored
+// never changes the task: the update stands, and the result is the stored
+// task, with the failure wrapping [ErrUpdateStored]. A failure before it is
+// stored leaves the task as it was.
+func (p *processor) processUpdate(ctx context.Context, event a2a.Event) (*taskexec.ProcessorResult, error) {
+	if _, err := p.updateManager.Process(ctx, event); err != nil {
+		return nil, fmt.Errorf("store the update: %w", err)
+	}
+	// The stored task is read before delivery and whatever happens to the
+	// call, so the caller learns what was stored.
+	result, err := p.loadResult(context.WithoutCancel(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("%w, but the task could not be read back: %w", ErrUpdateStored, err)
+	}
+	if err := p.deliverUpdate(ctx, event); err != nil {
+		result.ExecutionFailureCause = fmt.Errorf("%w: %w", ErrPushNotDelivered, err)
+	}
+	return result, nil
+}
+
+// deliverUpdate delivers the push notifications of an update's event to
+// every config of the task, and reports every delivery which failed, also
+// one whose sender reports it only in [push.DeliveryResult.Err].
+func (p *processor) deliverUpdate(ctx context.Context, event a2a.Event) error {
+	if p.pushDelivery == nil || p.pushConfigStore == nil {
+		return nil
+	}
+	configs, err := p.pushConfigStore.List(ctx, p.execCtx.TaskID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, config := range configs {
+		result, err := p.pushDelivery(ctx, &push.Delivery{Config: config, Event: event, Headers: http.Header{}})
+		if err == nil && result != nil {
+			err = result.Err
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ProcessError implements taskexec.ProcessError interface method.
