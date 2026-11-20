@@ -1579,7 +1579,7 @@ func TestRequestHandler_ListTasks(t *testing.T) {
 			givenTasks:   []*a2a.Task{{ID: id1}, {ID: id2}, {ID: id3}},
 			request:      &a2a.ListTasksRequest{},
 			wantResponse: &a2a.ListTasksResponse{Tasks: []*a2a.Task{{ID: id3}, {ID: id2}, {ID: id1}}, TotalSize: 3, PageSize: 50},
-			storeConfig:  &taskstore.InMemoryStoreConfig{Authenticator: testAuthenticator()},
+			storeConfig:  &taskstore.InMemoryStoreConfig{CallerAuthenticator: TaskStoreCallerFromName(testAuthenticator())},
 		},
 		{
 			name: "success with filters",
@@ -1590,7 +1590,7 @@ func TestRequestHandler_ListTasks(t *testing.T) {
 			},
 			request:      &a2a.ListTasksRequest{PageSize: 2, ContextID: "context1", Status: a2a.TaskStateCompleted, HistoryLength: new(2), StatusTimestampAfter: &cutOffTime, IncludeArtifacts: true},
 			wantResponse: &a2a.ListTasksResponse{Tasks: []*a2a.Task{{ID: id3, Artifacts: []*a2a.Artifact{{Name: "artifact3"}}, ContextID: "context1", History: []*a2a.Message{{ID: "test-message-8"}, {ID: "test-message-9"}}, Status: a2a.TaskStatus{State: a2a.TaskStateCompleted}}}, TotalSize: 1, PageSize: 2},
-			storeConfig:  &taskstore.InMemoryStoreConfig{Authenticator: testAuthenticator()},
+			storeConfig:  &taskstore.InMemoryStoreConfig{CallerAuthenticator: TaskStoreCallerFromName(testAuthenticator())},
 		},
 		{
 			name: "with HistoryLength 0",
@@ -1601,14 +1601,14 @@ func TestRequestHandler_ListTasks(t *testing.T) {
 			},
 			request:      &a2a.ListTasksRequest{HistoryLength: new(0)},
 			wantResponse: &a2a.ListTasksResponse{Tasks: []*a2a.Task{{ID: id3, History: []*a2a.Message{}}, {ID: id2, History: []*a2a.Message{}}, {ID: id1, History: []*a2a.Message{}}}, TotalSize: 3, PageSize: 50},
-			storeConfig:  &taskstore.InMemoryStoreConfig{Authenticator: testAuthenticator()},
+			storeConfig:  &taskstore.InMemoryStoreConfig{CallerAuthenticator: TaskStoreCallerFromName(testAuthenticator())},
 		},
 		{
 			name:        "invalid pageToken",
 			givenTasks:  []*a2a.Task{{ID: id1}, {ID: id2}, {ID: id3}},
 			request:     &a2a.ListTasksRequest{PageToken: "invalidPageToken"},
 			wantErr:     fmt.Errorf("failed to list tasks: %w", a2a.ErrParseError),
-			storeConfig: &taskstore.InMemoryStoreConfig{Authenticator: testAuthenticator()},
+			storeConfig: &taskstore.InMemoryStoreConfig{CallerAuthenticator: TaskStoreCallerFromName(testAuthenticator())},
 		},
 		{
 			name:       "unauthorized",
@@ -2847,7 +2847,7 @@ func TestLoadExecutionContext_HistoryUpdateConcurrentModification(t *testing.T) 
 func withTestTask(t *testing.T, taskID a2a.TaskID) RequestHandlerOption {
 	t.Helper()
 	ts := testutil.NewTestTaskStoreWithConfig(&taskstore.InMemoryStoreConfig{
-		Authenticator: testAuthenticator(),
+		CallerAuthenticator: TaskStoreCallerFromName(testAuthenticator()),
 	}).WithTasks(t, &a2a.Task{ID: taskID, ContextID: "test-context"})
 	return WithTaskStore(ts)
 }

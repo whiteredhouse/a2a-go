@@ -577,3 +577,41 @@ func TestInMemoryTaskStore_CrossTenantIsolation(t *testing.T) {
 		t.Fatalf("alice task ID mismatch")
 	}
 }
+
+func TestInMemoryTaskStore_ServerCaller(t *testing.T) {
+	type callerKey struct{}
+	store := NewInMemory(&InMemoryStoreConfig{CallerAuthenticator: func(ctx context.Context) (Caller, error) {
+		if caller, ok := ctx.Value(callerKey{}).(Caller); ok {
+			return caller, nil
+		}
+		return Caller{}, a2a.ErrUnauthenticated
+	}})
+	owner := context.WithValue(context.Background(), callerKey{}, Caller{Name: "alice"})
+	other := context.WithValue(context.Background(), callerKey{}, Caller{Name: "mallory"})
+	server := context.WithValue(context.Background(), callerKey{}, Caller{Server: true})
+	task := &a2a.Task{ID: a2a.NewTaskID(), ContextID: a2a.NewContextID(), Status: a2a.TaskStatus{State: a2a.TaskStateInputRequired}}
+	version, err := store.Create(owner, task)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := store.Get(other, task.ID); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("Get() as another user error = %v, want ErrTaskNotFound", err)
+	}
+	stored, err := store.Get(server, task.ID)
+	if err != nil || stored.User != "alice" {
+		t.Fatalf("Get() as the server = %v, %v, want alice's task", stored, err)
+	}
+	updated := *task
+	updated.Status = a2a.TaskStatus{State: a2a.TaskStateFailed}
+	if _, err := store.Update(other, &UpdateRequest{Task: &updated, PrevTask: task, PrevVersion: version}); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("Update() as another user error = %v, want ErrTaskNotFound", err)
+	}
+	if _, err := store.Update(server, &UpdateRequest{Task: &updated, PrevTask: task, PrevVersion: version}); err != nil {
+		t.Fatalf("Update() as the server error = %v", err)
+	}
+	// The owner keeps the task.
+	stored, err = store.Get(owner, task.ID)
+	if err != nil || stored.Task.Status.State != a2a.TaskStateFailed || stored.User != "alice" {
+		t.Errorf("Get() as owner after the server's update = %v, %v", stored, err)
+	}
+}
