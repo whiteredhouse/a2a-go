@@ -16,6 +16,7 @@ package a2asrv
 
 import (
 	"context"
+	"fmt"
 	"iter"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -55,6 +56,25 @@ type CallContext struct {
 
 	// tenant is an optional ID of the agent owner.
 	tenant string
+
+	// server is set only for the agent server's own calls ([NewServerCallContext]),
+	// so no request can claim it.
+	server bool
+}
+
+// NewServerCallContext returns ctx with the call context of the agent server's
+// own call, made for the agent rather than for a user, such as
+// [TaskUpdater.UpdateTask]. A task store which tells the server apart, as the
+// one of [NewTaskStoreCallerAuthenticator] does, gives it every task, and a task
+// keeps its owner when the server updates it.
+func NewServerCallContext(ctx context.Context) (context.Context, *CallContext) {
+	callCtx := &CallContext{User: &User{Authenticated: true}, server: true}
+	return context.WithValue(ctx, callContextKeyType{}, callCtx), callCtx
+}
+
+// IsServer reports whether the call is the agent server's own ([NewServerCallContext]).
+func (cc *CallContext) IsServer() bool {
+	return cc != nil && cc.server
 }
 
 // Method returns the name of the RequestHandler method which is being executed.
@@ -113,12 +133,44 @@ type CallInterceptor interface {
 }
 
 // NewTaskStoreAuthenticator returns a taskstore.Authenticator which uses the CallContext to get the user name.
+// A name can't stand for the agent server's own calls ([NewServerCallContext]), so it refuses them.
+//
+// Deprecated: Use [NewTaskStoreCallerAuthenticator], which serves the server's own calls too.
 func NewTaskStoreAuthenticator() taskstore.Authenticator {
 	return func(ctx context.Context) (string, error) {
 		if callCtx, ok := CallContextFrom(ctx); ok {
+			if callCtx.IsServer() {
+				return "", fmt.Errorf("the server's own call has no user name: %w", a2a.ErrUnauthenticated)
+			}
 			return callCtx.User.Name, nil
 		}
 		return "", a2a.ErrUnauthenticated
+	}
+}
+
+// NewTaskStoreCallerAuthenticator returns a taskstore.CallerAuthenticator
+// which uses the CallContext to get the user, and tells the agent server's
+// own calls ([NewServerCallContext]) apart.
+func NewTaskStoreCallerAuthenticator() taskstore.CallerAuthenticator {
+	return func(ctx context.Context) (taskstore.Caller, error) {
+		if callCtx, ok := CallContextFrom(ctx); ok {
+			return taskstore.Caller{Name: callCtx.User.Name, Server: callCtx.IsServer()}, nil
+		}
+		return taskstore.Caller{}, a2a.ErrUnauthenticated
+	}
+}
+
+// TaskStoreCallerFromName returns a taskstore.CallerAuthenticator for a
+// function which knows only user names, such as one of a fixed identity. It
+// refuses the agent server's own calls ([NewServerCallContext]) without
+// calling it, since a name can't stand for the server.
+func TaskStoreCallerFromName(name func(context.Context) (string, error)) taskstore.CallerAuthenticator {
+	return func(ctx context.Context) (taskstore.Caller, error) {
+		if callCtx, ok := CallContextFrom(ctx); ok && callCtx.IsServer() {
+			return taskstore.Caller{}, fmt.Errorf("the server's own call has no user name: %w", a2a.ErrUnauthenticated)
+		}
+		n, err := name(ctx)
+		return taskstore.Caller{Name: n}, err
 	}
 }
 

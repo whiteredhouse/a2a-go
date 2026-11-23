@@ -30,6 +30,22 @@ import (
 // condition with errors.Is.
 var ErrAgentInactivityTimeout = errors.New("agent inactivity timeout")
 
+// ErrExecutionActive is returned by [Manager.Update] when the task has an
+// active execution or cancelation, whose agent publishes the task's events
+// itself, or another update.
+var ErrExecutionActive = errors.New("task has an active execution, cancelation or update")
+
+// UpdateRequest is an update which the agent publishes to one of its tasks
+// outside an execution, such as ending a task which waits for input when the
+// input does not come in time.
+type UpdateRequest struct {
+	// TaskID is the ID of the task to update.
+	TaskID a2a.TaskID
+	// Event is the status update to publish. It is final: it ends the task
+	// or interrupts it, as the last event of an execution does.
+	Event *a2a.TaskStatusUpdateEvent
+}
+
 // Manager provides an API for executing and canceling tasks.
 type Manager interface {
 	// Resubscribe is used to resubscribe to events of an active execution.
@@ -38,6 +54,9 @@ type Manager interface {
 	Execute(ctx context.Context, req *a2a.SendMessageRequest) (Subscription, error)
 	// Cancel requests a task cancelation.
 	Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error)
+	// Update publishes events the agent produced outside an execution and
+	// returns the task they result in.
+	Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error)
 }
 
 // Subscription encapsulates the logic of subscribing to execution events.
@@ -56,6 +75,10 @@ type Factory interface {
 
 	// CreateCanceler is used to create initialized Canceler and Processor for a Task cancelation which will run in separate goroutines.
 	CreateCanceler(context.Context, *a2a.CancelTaskRequest) (Canceler, Processor, Cleaner, error)
+
+	// CreateUpdater is used to create initialized Updater and Processor for a Task update which will run in separate goroutines.
+	// The Cleaner may be nil: an update runs no execution, so it need not run execution cleanup.
+	CreateUpdater(context.Context, *UpdateRequest) (Updater, Processor, Cleaner, error)
 }
 
 // Processor implementation handles events produced during AgentExecution.
@@ -95,6 +118,12 @@ type Canceler interface {
 	// Cancel attempts to cancel a Task.
 	// Expected to produce a Task update event with canceled state.
 	Cancel(context.Context, eventpipe.Writer) error
+}
+
+// Updater implementation writes the events of a Task update.
+type Updater interface {
+	// Update writes the events of the update.
+	Update(context.Context, eventpipe.Writer) error
 }
 
 // Cleaner implementation can be used to run callbacks after execution or cancellation completes.

@@ -36,12 +36,23 @@ type storedTask struct {
 }
 
 // Authenticator is a function that returns the name of the user who created the task.
+//
+// Deprecated: Use [CallerAuthenticator], which also tells the agent server's own calls apart.
 type Authenticator func(context.Context) (string, error)
 
 // InMemoryStoreConfig is a configuration for [InMemory] store.
 type InMemoryStoreConfig struct {
+	// Authenticator returns the name of the user a call is made for. It is
+	// used only when CallerAuthenticator is nil.
+	//
+	// Deprecated: Use CallerAuthenticator.
 	Authenticator Authenticator
-	TimeProvider  func() time.Time
+	// CallerAuthenticator returns who a call is made for: a user, whose tasks
+	// only they reach, or the agent server itself ([Caller.Server]), which
+	// reaches every task. Without it (and Authenticator), every call is the
+	// anonymous user's.
+	CallerAuthenticator CallerAuthenticator
+	TimeProvider        func() time.Time
 }
 
 // InMemory is an implementation of [Store] which stores tasks in memory.
@@ -69,13 +80,28 @@ func NewInMemory(config *InMemoryStoreConfig) *InMemory {
 		}
 	}
 
-	if m.config.Authenticator == nil {
-		m.config.Authenticator = func(ctx context.Context) (string, error) {
-			return "", nil
+	if m.config.CallerAuthenticator == nil {
+		name := m.config.Authenticator
+		m.config.CallerAuthenticator = func(ctx context.Context) (Caller, error) {
+			if name == nil {
+				return Caller{}, nil
+			}
+			n, err := name(ctx)
+			return Caller{Name: n}, err
 		}
 	}
 
 	return m
+}
+
+// caller returns the identity a call is made for.
+func (s *InMemory) caller(ctx context.Context) (Caller, error) {
+	return s.config.CallerAuthenticator(ctx)
+}
+
+// owns reports whether the caller may reach a task of owner's.
+func (c Caller) owns(owner string) bool {
+	return c.Server || c.Name == owner
 }
 
 // Create implements [Store] interface.
@@ -84,10 +110,11 @@ func (s *InMemory) Create(ctx context.Context, task *a2a.Task) (TaskVersion, err
 		return TaskVersionMissing, err
 	}
 
-	userName, err := s.config.Authenticator(ctx)
+	caller, err := s.caller(ctx)
 	if err != nil {
 		return TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
 	}
+	userName := caller.Name
 
 	taskCopy, err := utils.DeepCopy(task)
 	if err != nil {
@@ -116,7 +143,7 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 		return TaskVersionMissing, err
 	}
 
-	userName, err := s.config.Authenticator(ctx)
+	caller, err := s.caller(ctx)
 	if err != nil {
 		return TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
 	}
@@ -134,7 +161,7 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 		return TaskVersionMissing, a2a.ErrTaskNotFound
 	}
 
-	if stored.user != userName {
+	if !caller.owns(stored.user) {
 		return TaskVersionMissing, a2a.ErrTaskNotFound
 	}
 
@@ -163,11 +190,11 @@ func (s *InMemory) Get(ctx context.Context, taskID a2a.TaskID) (*StoredTask, err
 	}
 
 	// Mask ownership mismatch as ErrTaskNotFound per A2A spec §3.3.2
-	userName, err := s.config.Authenticator(ctx)
+	caller, err := s.caller(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("taskstore auth failed: %w", err)
 	}
-	if storedTask.user != userName {
+	if !caller.owns(storedTask.user) {
 		return nil, a2a.ErrTaskNotFound
 	}
 
@@ -182,7 +209,8 @@ func (s *InMemory) Get(ctx context.Context, taskID a2a.TaskID) (*StoredTask, err
 // List implements [Store] interface.
 func (s *InMemory) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2a.ListTasksResponse, error) {
 	const defaultPageSize = 50
-	userName, err := s.config.Authenticator(ctx)
+	caller, err := s.caller(ctx)
+	userName := caller.Name
 	if userName == "" || err != nil {
 		return nil, a2a.ErrUnauthenticated
 	}

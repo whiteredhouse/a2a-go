@@ -227,6 +227,12 @@ func (m *distributedManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequ
 	return convertToCancelationResult(ctx, storedTask.Task, nil)
 }
 
+// Update is not supported in cluster mode yet: the work queue has no payload
+// for an update.
+func (m *distributedManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error) {
+	return nil, fmt.Errorf("task updates in cluster mode: %w", a2a.ErrUnsupportedOperation)
+}
+
 func (m *distributedManager) encodeContext(ctx context.Context) (map[string]any, error) {
 	if m.ctxCodec == nil {
 		return nil, nil

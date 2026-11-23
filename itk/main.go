@@ -534,7 +534,7 @@ func run() error {
 	// unauthenticated. One fixed identity gives the store something to scope
 	// by without pretending to implement an auth scheme.
 	taskStore := taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-		Authenticator: func(context.Context) (string, error) { return "itk", nil },
+		CallerAuthenticator: a2asrv.TaskStoreCallerFromName(func(context.Context) (string, error) { return "itk", nil }),
 	})
 
 	pushStore := push.NewInMemoryStore()

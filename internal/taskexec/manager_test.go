@@ -36,6 +36,14 @@ import (
 type testFactory struct {
 	CreateExecutorFn func(context.Context, a2a.TaskID, *a2a.SendMessageRequest) (Executor, Processor, Cleaner, error)
 	CreateCancelerFn func(context.Context, *a2a.CancelTaskRequest) (Canceler, Processor, Cleaner, error)
+	CreateUpdaterFn  func(context.Context, *UpdateRequest) (Updater, Processor, Cleaner, error)
+}
+
+func (f *testFactory) CreateUpdater(ctx context.Context, req *UpdateRequest) (Updater, Processor, Cleaner, error) {
+	if f.CreateUpdaterFn != nil {
+		return f.CreateUpdaterFn(ctx, req)
+	}
+	return nil, nil, nil, fmt.Errorf("not implemented")
 }
 
 var _ Factory = (*testFactory)(nil)

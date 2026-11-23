@@ -233,7 +233,7 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 
 	if h.workQueue == nil && h.taskStore == nil {
 		h.taskStore = taskstore.NewInMemory(&taskstore.InMemoryStoreConfig{
-			Authenticator: NewTaskStoreAuthenticator(),
+			CallerAuthenticator: NewTaskStoreCallerAuthenticator(),
 		})
 	}
 	if h.taskStore != nil {
@@ -287,6 +287,61 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 	}
 
 	return ih
+}
+
+// ErrUpdateStored is wrapped by the error of [TaskUpdater.UpdateTask] when
+// the update was stored but a later step failed: the update stands. UpdateTask
+// then returns the stored task too, when it could read it back.
+var ErrUpdateStored = errors.New("the update was stored")
+
+// ErrPushNotDelivered is returned by [TaskUpdater.UpdateTask] when the update
+// was stored but a push notification of it was not delivered. It wraps
+// [ErrUpdateStored], and UpdateTask returns the stored task with it.
+var ErrPushNotDelivered = fmt.Errorf("%w, but its push notification was not delivered", ErrUpdateStored)
+
+// ErrTaskActive is returned by [TaskUpdater.UpdateTask] when the task has an
+// active execution, cancelation or update. The update may be retried once it
+// ends.
+var ErrTaskActive = taskexec.ErrExecutionActive
+
+// TaskUpdater is implemented by the request handler which [NewHandler]
+// returns. It lets the agent publish a status update of one of its tasks
+// outside a request, such as ending a task which waits for input when the input does not
+// come in time. It is the server's own call, not a caller's: it is not served
+// to clients and runs no call interceptors. It is made as the server's own
+// call ([NewServerCallContext]), which reaches the task whoever owns it in a store
+// that tells the server apart ([taskstore.Caller.Server]), as the default
+// in-memory store does; a store that doesn't refuses it.
+type TaskUpdater interface {
+	// UpdateTask publishes a status update of one of the agent's tasks through
+	// the same pipeline as the events of an execution: the task store and push
+	// notifications. The event is final: it ends the task or interrupts it
+	// (such as input required), as the last event of an execution does. It
+	// takes one event so that the update is written whole or not at all. A
+	// task which has ended is refused, and a task with an active execution,
+	// cancelation or update is refused with [ErrTaskActive]: during an
+	// execution its agent publishes the events itself. A message or
+	// cancelation of the task which comes during the update is refused as
+	// busy, and may be retried. UpdateTask returns the task the event results
+	// in. When the event was stored but a later step failed, the error wraps
+	// [ErrUpdateStored]: the update stands. A push notification which was not
+	// delivered, by an error or a failed delivery result, or because ctx ended
+	// during delivery, gives [ErrPushNotDelivered] with the stored task. It is not supported in cluster
+	// mode ([WithClusterMode]) yet.
+	UpdateTask(ctx context.Context, event *a2a.TaskStatusUpdateEvent) (*a2a.Task, error)
+}
+
+// UpdateTask implements [TaskUpdater].
+func (h *defaultRequestHandler) UpdateTask(ctx context.Context, event *a2a.TaskStatusUpdateEvent) (*a2a.Task, error) {
+	if event == nil || event.TaskID == "" {
+		return nil, fmt.Errorf("missing TaskID: %w", a2a.ErrInvalidParams)
+	}
+	ctx, _ = NewServerCallContext(ctx)
+	task, err := h.execManager.Update(ctx, &taskexec.UpdateRequest{TaskID: event.TaskID, Event: event})
+	if err != nil {
+		return task, fmt.Errorf("failed to update: %w", err)
+	}
+	return task, nil
 }
 
 // GetTask implements RequestHandler.

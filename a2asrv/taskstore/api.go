@@ -79,6 +79,21 @@ type UpdateRequest struct {
 	PrevVersion TaskVersion
 }
 
+// Caller is the identity a store call is made for.
+type Caller struct {
+	// Name is the user the call is made for. A task belongs to the user who
+	// created it, and other users don't see it.
+	Name string
+	// Server is true for the agent server's own calls, made for the agent
+	// rather than for a user, such as an update the agent publishes to a task
+	// outside a request ([a2asrv.TaskUpdater]). A store gives the server every
+	// task, and the task keeps its owner when the server updates it.
+	Server bool
+}
+
+// CallerAuthenticator returns the identity a store call is made for.
+type CallerAuthenticator func(context.Context) (Caller, error)
+
 // Store is an interface the server stack uses for storing and retrieving tasks.
 type Store interface {
 	// Create creates a new task. It should return [ErrTaskAlreadyExists] if a task with the provided ID already exists.

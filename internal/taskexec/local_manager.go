@@ -38,6 +38,11 @@ var (
 	// ErrCancelationInProgress is returned when a caller attempts to start an execution for
 	// a Task concurrently with its cancelation.
 	ErrCancelationInProgress = a2a.NewError(a2a.ErrUnsupportedOperation, "task cancelation is in progress")
+	// ErrUpdateInProgress is returned when a caller attempts to start an execution or a
+	// cancelation of a Task while the agent publishes an update to it. The call may be
+	// retried: it is refused rather than queued, because the update may be delivering a
+	// push notification whose recipient answers before acknowledging it.
+	ErrUpdateInProgress = a2a.NewError(a2a.ErrUnsupportedOperation, "task update is in progress")
 )
 
 // localManager provides an API for executing and canceling tasks in a way that ensures
@@ -60,7 +65,9 @@ type localManager struct {
 	mu           sync.Mutex
 	executions   map[a2a.TaskID]*localExecution
 	cancelations map[a2a.TaskID]*cancelation
-	limiter      *concurrencyLimiter
+	// updates holds the tasks with an update in progress; the channel is closed when it ends.
+	updates map[a2a.TaskID]chan struct{}
+	limiter *concurrencyLimiter
 }
 
 type cancelation struct {
@@ -109,6 +116,7 @@ func NewLocalManager(cfg LocalManagerConfig) Manager {
 		limiter:           newConcurrencyLimiter(cfg.ConcurrencyConfig),
 		executions:        make(map[a2a.TaskID]*localExecution),
 		cancelations:      make(map[a2a.TaskID]*cancelation),
+		updates:           make(map[a2a.TaskID]chan struct{}),
 	}
 	if manager.queueManager == nil {
 		manager.queueManager = eventqueue.NewInMemoryManager()
@@ -214,6 +222,10 @@ func (m *localManager) createExecution(ctx context.Context, tid a2a.TaskID, req 
 		return nil, ErrCancelationInProgress
 	}
 
+	if _, ok := m.updates[tid]; ok {
+		return nil, ErrUpdateInProgress
+	}
+
 	if err := m.limiter.acquireQuotaLocked(ctx); err != nil {
 		return nil, fmt.Errorf("concurrency quota exceeded: %w", err)
 	}
@@ -230,8 +242,12 @@ func (m *localManager) createExecution(ctx context.Context, tid a2a.TaskID, req 
 // subscribed to the Execution will receive a task cancelation event and handle it accordingly.
 // If there's no active Execution Canceler will be processing task events.
 func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error) {
-	m.mu.Lock()
 	tid := req.ID
+	m.mu.Lock()
+	if _, ok := m.updates[tid]; ok {
+		m.mu.Unlock()
+		return nil, ErrUpdateInProgress
+	}
 	execution := m.executions[tid]
 	cancel, cancelInProgress := m.cancelations[tid]
 
@@ -254,6 +270,85 @@ func (m *localManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequest) (
 
 	result, err := cancel.result.wait(ctx)
 	return convertToCancelationResult(ctx, result, err)
+}
+
+// Update publishes the events of req through the task's update pipeline: the
+// task store and push notifications, as for the events of an execution. A task
+// with an active execution, cancelation or update is refused with
+// [ErrExecutionActive]: its agent publishes events through that execution. The
+// update holds the task, under the lock which admits executions and
+// cancelations, until it ends: an execution or cancelation which comes in the
+// meantime is refused with [ErrUpdateInProgress], and a retry sees the
+// update's result. A failure the processor reports with its result fails the
+// update, which then returns both: the task as stored, and the failure.
+func (m *localManager) Update(ctx context.Context, req *UpdateRequest) (*a2a.Task, error) {
+	tid := req.TaskID
+	m.mu.Lock()
+	_, executing := m.executions[tid]
+	_, canceling := m.cancelations[tid]
+	_, updating := m.updates[tid]
+	if executing || canceling || updating {
+		m.mu.Unlock()
+		return nil, ErrExecutionActive
+	}
+	done := make(chan struct{})
+	m.updates[tid] = done
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.updates, tid)
+		close(done)
+		m.mu.Unlock()
+	}()
+
+	updater, processor, cleaner, err := m.factory.CreateUpdater(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("updater setup failed: %w", err)
+	}
+
+	pipe := eventpipe.NewLocal()
+	defer pipe.Close()
+
+	// The processor turns an event it can't apply into a failed task and a
+	// failure cause, which the result alone would hide.
+	var failure error
+	handler := &executionHandler{
+		agentEvents: pipe.Reader,
+		handleEventFn: func(ctx context.Context, event a2a.Event) (*ProcessorResult, error) {
+			res, err := processor.Process(ctx, event)
+			if err == nil && res != nil && res.ExecutionFailureCause != nil {
+				failure = res.ExecutionFailureCause
+			}
+			return res, err
+		},
+		handleErrorFn: func(ctx context.Context, err error) (a2a.SendMessageResult, error) { return nil, err },
+	}
+	result, err := runProducerConsumer(
+		ctx,
+		func(ctx context.Context) error { return updater.Update(ctx, pipe.Writer) },
+		handler.processEvents,
+		nil,
+		m.panicHandler,
+		nil,
+	)
+
+	if cleaner != nil {
+		cleaner.Cleanup(ctx, result, err)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("update failed: %w", err)
+	}
+	task, ok := result.(*a2a.Task)
+	if !ok {
+		return nil, fmt.Errorf("bug: update result was %T, not a task", result)
+	}
+	if failure != nil {
+		// The task is what the store holds after the update, so the caller
+		// can tell what was written.
+		return task, fmt.Errorf("update failed: %w", failure)
+	}
+	return task, nil
 }
 
 func (m *localManager) cleanupExecution(ctx context.Context, execution *localExecution) {
